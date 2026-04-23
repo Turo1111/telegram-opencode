@@ -10,12 +10,14 @@ import {
 import { Config } from "./config";
 import { callOpenCode } from "./opencode";
 import { logger } from "./logger";
+import { sendTelegramText, TELEGRAM_CONTENT_KIND } from "./adapters/telegram/message-sender";
 
 export interface HandlerDeps {
   bot: TelegramBot;
   useCases: ApplicationUseCases;
   persistence?: PersistenceDriver;
   config: Config;
+  callOpenCodeFn?: typeof callOpenCode;
 }
 
 function normalizeActorId(from: TelegramBot.User | undefined): string | undefined {
@@ -127,7 +129,8 @@ export function createMessageHandler(deps: HandlerDeps) {
 
     if (status.ok) {
       try {
-        const legacyResponse = await callOpenCode(deps.config, {
+        const openCodeCaller = deps.callOpenCodeFn ?? callOpenCode;
+        const legacyResponse = await openCodeCaller(deps.config, {
           prompt: text,
           userId: chatId,
           metadata: {
@@ -142,7 +145,12 @@ export function createMessageHandler(deps: HandlerDeps) {
           chatId,
           compatLegacyTextBridge: deps.config.compatLegacyTextBridge,
         });
-        await deps.bot.sendMessage(Number(chatId), answer);
+        await sendTelegramText({
+          bot: deps.bot,
+          chatId: Number(chatId),
+          text: answer,
+          contentKind: TELEGRAM_CONTENT_KIND.MODEL,
+        });
         return;
       } catch (error) {
         logger.error("Legacy compatibility bridge failed; falling back to session router", {

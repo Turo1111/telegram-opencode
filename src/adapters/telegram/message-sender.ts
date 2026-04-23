@@ -7,6 +7,13 @@ import {
 } from "../../application/contracts";
 import { PENDING_PROMPT_STATUS, PROMPT_TYPE } from "../../domain/entities";
 import { logger } from "../../logger";
+import {
+  formatOutboundForTelegram,
+  normalizeTelegramWhitespace,
+  stripTelegramHtmlToPlainText,
+  TELEGRAM_OUTBOUND_TOKEN,
+  TelegramOutboundContentKind,
+} from "./format-outbound";
 import { sanitizeTelegramHtml } from "./sanitize";
 import {
   formatActiveHumanPrompt,
@@ -21,10 +28,14 @@ const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 const TELEGRAM_SAFE_CHUNK_LENGTH = 3800;
 const TRUNCATION_NOTICE = "… [recortado por límite de Telegram]";
 
+export const TELEGRAM_CONTENT_KIND = TELEGRAM_OUTBOUND_TOKEN;
+export type TelegramContentKind = TelegramOutboundContentKind;
+
 export interface SendTelegramTextInput {
   readonly bot: TelegramBot;
   readonly chatId: number;
   readonly text: string;
+  readonly contentKind?: TelegramContentKind;
 }
 
 export interface SendBootRecoveryNoticesInput {
@@ -39,7 +50,12 @@ export interface SendAsyncSessionNoticeInput {
 }
 
 export async function sendTelegramText(input: SendTelegramTextInput): Promise<void> {
-  const sanitized = sanitizeTelegramHtml(input.text);
+  const sanitized = sanitizeTelegramHtml(
+    formatOutboundForTelegram({
+      text: input.text,
+      contentKind: input.contentKind ?? TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE,
+    })
+  );
   const chunks = chunkTelegramMessage(sanitized);
 
   logger.info("Telegram sender chunk plan", {
@@ -82,6 +98,7 @@ export async function sendBootRecoveryNotices(input: SendBootRecoveryNoticesInpu
         bot: input.bot,
         chatId: numericChatId,
         text: formatRecoveryNotice(notice),
+        contentKind: TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE,
       });
     } catch (error) {
       logger.error("Failed to dispatch boot recovery notice", {
@@ -134,6 +151,7 @@ export async function sendAsyncSessionNotice(input: SendAsyncSessionNoticeInput)
       bot: input.bot,
       chatId: numericChatId,
       text: formatAsyncSessionNotice(input.notice),
+      contentKind: TELEGRAM_CONTENT_KIND.MODEL,
     });
   }
 }
@@ -144,11 +162,14 @@ async function sendPromptMessage(
   prompt: NonNullable<AsyncSessionNotice["prompt"]>
 ): Promise<TelegramBot.Message> {
   const text = sanitizeTelegramHtml(
-    formatActiveHumanPrompt({
-      message: prompt.message,
-      promptType: prompt.promptType,
-      options: prompt.options,
-      expiresAt: prompt.expiresAt,
+    formatOutboundForTelegram({
+      text: formatActiveHumanPrompt({
+        message: prompt.message,
+        promptType: prompt.promptType,
+        options: prompt.options,
+        expiresAt: prompt.expiresAt,
+      }),
+      contentKind: TELEGRAM_CONTENT_KIND.MODEL,
     })
   );
 
@@ -315,7 +336,8 @@ async function sendWithParseModeFallback(
       fallbackPlainText: true,
     });
 
-    const prefixedPlainText = chunkCount > 1 ? `(${chunkIndex}/${chunkCount})\n${htmlText}` : htmlText;
+    const plainText = stripTelegramHtmlToPlainText(htmlText);
+    const prefixedPlainText = chunkCount > 1 ? `(${chunkIndex}/${chunkCount})\n${plainText}` : plainText;
     await bot.sendMessage(chatId, prefixedPlainText);
   }
 }
@@ -330,11 +352,12 @@ function isParseModeError(error: unknown): boolean {
 }
 
 function chunkTelegramMessage(text: string): string[] {
-  if (text.length <= TELEGRAM_MAX_MESSAGE_LENGTH) {
-    return [text];
+  const normalizedText = normalizeTelegramWhitespace(text);
+  if (normalizedText.length <= TELEGRAM_MAX_MESSAGE_LENGTH) {
+    return [normalizedText];
   }
 
-  const paragraphs = text.split("\n\n");
+  const paragraphs = normalizedText.split("\n\n");
   const chunks: string[] = [];
   let current = "";
 
@@ -373,11 +396,15 @@ function chunkTelegramMessage(text: string): string[] {
 }
 
 function splitParagraphIntoSafeSegments(paragraph: string): string[] {
-  if (paragraph.length <= TELEGRAM_SAFE_CHUNK_LENGTH) {
-    return [paragraph];
+  const normalizedParagraph = paragraph.includes("<") && paragraph.length > TELEGRAM_SAFE_CHUNK_LENGTH
+    ? sanitizeTelegramHtml(stripTelegramHtmlToPlainText(paragraph))
+    : paragraph;
+
+  if (normalizedParagraph.length <= TELEGRAM_SAFE_CHUNK_LENGTH) {
+    return [normalizedParagraph];
   }
 
-  const lines = paragraph.split("\n");
+  const lines = normalizedParagraph.split("\n");
   const segments: string[] = [];
   let current = "";
 

@@ -33,7 +33,7 @@ import {
   formatUsage,
 } from "./templates";
 import { logger } from "../../logger";
-import { sendTelegramText } from "./message-sender";
+import { sendTelegramText, TELEGRAM_CONTENT_KIND, TelegramContentKind } from "./message-sender";
 import { ADAPTER_ERROR_CODES } from "../../application/contracts";
 import { OPEN_CODE_ADAPTER_MODE, OpenCodeAdapterMode } from "../../infrastructure/opencode-adapter-mode";
 
@@ -385,7 +385,8 @@ async function handleCommand(deps: TelegramRouterDeps, chatId: string, text: str
   const intent = parseCommandIntent(text);
   const policy = resolveCommandPolicy(intent);
   const numericChatId = Number(chatId);
-  const send = (message: string) => sendTelegramText({ bot: deps.bot, chatId: numericChatId, text: message });
+  const send = (message: string, contentKind: TelegramContentKind = TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE) =>
+    sendTelegramText({ bot: deps.bot, chatId: numericChatId, text: message, contentKind });
 
   try {
     logger.info("Telegram route decision", {
@@ -530,7 +531,10 @@ async function handleCommand(deps: TelegramRouterDeps, chatId: string, text: str
         return;
       }
 
-      await send(`${formatLegacyRunCmdDeprecationNotice()}\n\n${formatRunCommandSuccess(result.value)}`);
+      await send(
+        `${formatLegacyRunCmdDeprecationNotice()}\n\n${formatRunCommandSuccess(result.value)}`,
+        TELEGRAM_CONTENT_KIND.MODEL
+      );
       return;
     }
 
@@ -582,7 +586,8 @@ function shouldRejectBusyCommand(status: StatusOutput, policy: CommandPolicy, in
 async function handleText(deps: TelegramRouterDeps, chatId: string, text: string): Promise<void> {
   try {
     const numericChatId = Number(chatId);
-    const send = (message: string) => sendTelegramText({ bot: deps.bot, chatId: numericChatId, text: message });
+    const send = (message: string, contentKind: TelegramContentKind = TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE) =>
+      sendTelegramText({ bot: deps.bot, chatId: numericChatId, text: message, contentKind });
     const status = await deps.useCases.getStatus(chatId);
     if (!status.ok) {
       await send(formatDomainError(status.error));
@@ -686,7 +691,7 @@ async function handleText(deps: TelegramRouterDeps, chatId: string, text: string
         reason: "bridge-accepted",
       });
 
-      await send(formatSendSuccess("Respuesta enviada. Continúo con la sesión…", false));
+      await send(formatSendSuccess("Respuesta enviada. Continúo con la sesión…", false), TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE);
       return;
     }
 
@@ -696,13 +701,21 @@ async function handleText(deps: TelegramRouterDeps, chatId: string, text: string
       return;
     }
 
-    await send(formatSendSuccess(result.value.reply ?? result.value.message, result.value.needsAttention));
+    await send(
+      formatSendSuccess(result.value.reply ?? result.value.message, result.value.needsAttention),
+      TELEGRAM_CONTENT_KIND.MODEL
+    );
   } catch (error) {
     logger.error("Telegram text handling failed", {
       chatId,
       message: error instanceof Error ? error.message : String(error),
     });
-    await sendTelegramText({ bot: deps.bot, chatId: Number(chatId), text: formatUnknownError() });
+    await sendTelegramText({
+      bot: deps.bot,
+      chatId: Number(chatId),
+      text: formatUnknownError(),
+      contentKind: TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE,
+    });
   }
 }
 

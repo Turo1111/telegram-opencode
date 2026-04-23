@@ -4,7 +4,7 @@ import { PersistenceDriver } from "./contracts";
 import { exportSession, OpenCodeCliMessage, OPEN_CODE_CLI_ROLE } from "../infrastructure/opencode-cli";
 import { readOpenCodeLocalSessionMessages } from "../infrastructure/opencode-local-store";
 import { OPEN_CODE_ADAPTER_MODE } from "../infrastructure/opencode-adapter-mode";
-import { sendTelegramText } from "../adapters/telegram/message-sender";
+import { sendTelegramText, TELEGRAM_CONTENT_KIND } from "../adapters/telegram/message-sender";
 import { logger } from "../logger";
 
 export interface OpenCodeCliMirrorServiceDeps {
@@ -147,6 +147,7 @@ export function createOpenCodeCliMirrorService(deps: OpenCodeCliMirrorServiceDep
         bot: deps.bot,
         chatId: numericChatId,
         text: message.text,
+        contentKind: TELEGRAM_CONTENT_KIND.MODEL,
       });
 
       lastSeenAssistantMessageKeyBySession.set(target.sessionId, buildMessageKey(message));

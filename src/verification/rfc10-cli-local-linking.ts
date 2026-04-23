@@ -4,7 +4,7 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import TelegramBot from "node-telegram-bot-api";
 import { loadConfig, Config, STATE_DRIVERS } from "../config";
-import { createApplicationUseCases } from "../application/use-cases";
+import { ApplicationUseCases, createApplicationUseCases } from "../application/use-cases";
 import {
   extractOpenCodeCliAssistantReply,
   OPEN_CODE_CLI_ROLE,
@@ -19,6 +19,10 @@ import { createOpenCodeCliMirrorService } from "../application/opencode-cli-mirr
 import { readOpenCodeLocalSessionMessages } from "../infrastructure/opencode-local-store";
 import { bootstrapApplication } from "../index";
 import { createTelegramRouter } from "../adapters/telegram/router";
+import { createMessageHandler } from "../handlers";
+import { sanitizeTelegramHtml } from "../adapters/telegram/sanitize";
+import { formatOutboundForTelegram } from "../adapters/telegram/format-outbound";
+import { sendTelegramText, TELEGRAM_CONTENT_KIND } from "../adapters/telegram/message-sender";
 import { DomainError, ERROR_CODES } from "../domain/errors";
 import { createJsonPersistenceDriver } from "../infrastructure/persistence/json-store";
 import { logger } from "../logger";
@@ -38,8 +42,194 @@ async function main(): Promise<void> {
   await verifyMirrorSweepAndDedupe();
   await verifyMirrorFailureIsolation();
   await verifyStartupBranching();
+  await verifyTelegramFormatterSubsetAndFallback();
+  await verifyTelegramPlainContentBypass();
+  await verifyTelegramAmbiguousMarkdownDegradesSafely();
+  await verifyTelegramAllowlistSanitization();
+  await verifyTelegramHtmlSafeChunking();
+  await verifyTelegramNativeContentBypass();
+  await verifyLegacyBridgeUsesCentralSender();
 
   console.log("RFC-010 CLI local linking verification passed");
+}
+
+async function verifyTelegramFormatterSubsetAndFallback(): Promise<void> {
+  const calls: Array<{ readonly text: string; readonly parseMode?: string }> = [];
+  const bot = {
+    async sendMessage(_chatId: number, text: string, options?: TelegramBot.SendMessageOptions) {
+      calls.push({ text, parseMode: options?.parse_mode });
+      if (options?.parse_mode === "HTML") {
+        throw new Error("can't parse entities");
+      }
+
+      return { message_id: calls.length } as TelegramBot.Message;
+    },
+  } as TelegramBot;
+
+  await sendTelegramText({
+    bot,
+    chatId: 101,
+    text: "# Título\n- item\n**bold** y `code` y [doc](https://example.com)",
+    contentKind: TELEGRAM_CONTENT_KIND.MODEL,
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0]?.parseMode, "HTML");
+  assert.match(calls[0]?.text ?? "", /<b>Título<\/b>/);
+  assert.match(calls[0]?.text ?? "", /• item/);
+  assert.match(calls[0]?.text ?? "", /<b>bold<\/b>/);
+  assert.match(calls[0]?.text ?? "", /<code>code<\/code>/);
+  assert.match(calls[0]?.text ?? "", /<a href="https:\/\/example\.com\/">doc<\/a>/);
+  assert.equal(calls[1]?.parseMode, undefined);
+  assert.doesNotMatch(calls[1]?.text ?? "", /<[^>]+>/);
+  assert.match(calls[1]?.text ?? "", /doc: https:\/\/example\.com\//);
+}
+
+async function verifyTelegramPlainContentBypass(): Promise<void> {
+  const sent: Array<{ readonly text: string; readonly parseMode?: string }> = [];
+  const input = "**console**\n_name_with_underscores_\n[doc](https://example.com)";
+  const bot = {
+    async sendMessage(_chatId: number, text: string, options?: TelegramBot.SendMessageOptions) {
+      sent.push({ text, parseMode: options?.parse_mode });
+      return { message_id: sent.length } as TelegramBot.Message;
+    },
+  } as TelegramBot;
+
+  assert.equal(
+    formatOutboundForTelegram({
+      text: input,
+      contentKind: TELEGRAM_CONTENT_KIND.PLAIN,
+    }),
+    input
+  );
+
+  await sendTelegramText({
+    bot,
+    chatId: 202,
+    text: input,
+    contentKind: TELEGRAM_CONTENT_KIND.PLAIN,
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.parseMode, "HTML");
+  assert.equal(sent[0]?.text, input);
+  assert.doesNotMatch(sent[0]?.text ?? "", /<b>|<i>|<a href=/);
+}
+
+async function verifyTelegramAmbiguousMarkdownDegradesSafely(): Promise<void> {
+  const sent: Array<{ readonly text: string; readonly parseMode?: string }> = [];
+  const bot = {
+    async sendMessage(_chatId: number, text: string, options?: TelegramBot.SendMessageOptions) {
+      sent.push({ text, parseMode: options?.parse_mode });
+      return { message_id: sent.length } as TelegramBot.Message;
+    },
+  } as TelegramBot;
+
+  await sendTelegramText({
+    bot,
+    chatId: 203,
+    text: "Archivo _name_with_underscores_ y _itálica segura_",
+    contentKind: TELEGRAM_CONTENT_KIND.MODEL,
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.parseMode, "HTML");
+  assert.match(sent[0]?.text ?? "", /_name_with_underscores_/);
+  assert.match(sent[0]?.text ?? "", /<i>itálica segura<\/i>/);
+  assert.doesNotMatch(sent[0]?.text ?? "", /<i>name_with_underscores<\/i>/);
+}
+
+async function verifyTelegramAllowlistSanitization(): Promise<void> {
+  const sanitized = sanitizeTelegramHtml(
+    '<b>ok</b> <script>x</script> <a href="javascript:alert(1)">bad</a> <a href="https://example.com">good</a>'
+  );
+
+  assert.match(sanitized, /<b>ok<\/b>/);
+  assert.match(sanitized, /&lt;script&gt;x&lt;\/script&gt;/);
+  assert.match(sanitized, /&lt;a href=&quot;javascript:alert\(1\)&quot;&gt;bad<\/a>/);
+  assert.match(sanitized, /<a href="https:\/\/example\.com\/">good<\/a>/);
+}
+
+async function verifyTelegramHtmlSafeChunking(): Promise<void> {
+  const sentMessages: string[] = [];
+  const bot = {
+    async sendMessage(_chatId: number, text: string) {
+      sentMessages.push(text);
+      return { message_id: sentMessages.length } as TelegramBot.Message;
+    },
+  } as TelegramBot;
+
+  const longCodeBlock = `\`\`\`ts\n${"console.log('hola');\n".repeat(450)}\`\`\``;
+  await sendTelegramText({
+    bot,
+    chatId: 101,
+    text: longCodeBlock,
+    contentKind: TELEGRAM_CONTENT_KIND.MODEL,
+  });
+
+  assert.ok(sentMessages.length >= 2);
+  assert.match(sentMessages[0] ?? "", /^\(1\/\d+\)/);
+  assert.ok(sentMessages.every((message) => !message.includes("<pre>") || message.includes("</pre>")));
+}
+
+async function verifyTelegramNativeContentBypass(): Promise<void> {
+  const sent: Array<{ readonly text: string; readonly parseMode?: string }> = [];
+  const input = "<b>Plantilla nativa</b> **no adaptar** [doc](https://example.com)\n# sin heading";
+  const bot = {
+    async sendMessage(_chatId: number, text: string, options?: TelegramBot.SendMessageOptions) {
+      sent.push({ text, parseMode: options?.parse_mode });
+      return { message_id: sent.length } as TelegramBot.Message;
+    },
+  } as TelegramBot;
+
+  await sendTelegramText({
+    bot,
+    chatId: 204,
+    text: input,
+    contentKind: TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE,
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.parseMode, "HTML");
+  assert.match(sent[0]?.text ?? "", /<b>Plantilla nativa<\/b>/);
+  assert.match(sent[0]?.text ?? "", /\*\*no adaptar\*\*/);
+  assert.match(sent[0]?.text ?? "", /\[doc\]\(https:\/\/example\.com\)/);
+  assert.match(sent[0]?.text ?? "", /# sin heading/);
+  assert.doesNotMatch(sent[0]?.text ?? "", /<a href="https:\/\/example\.com\/">doc<\/a>/);
+}
+
+async function verifyLegacyBridgeUsesCentralSender(): Promise<void> {
+  const sent: Array<{ readonly text: string; readonly parseMode?: string }> = [];
+  const handler = createMessageHandler({
+    bot: {
+      async sendMessage(_chatId: number, text: string, options?: TelegramBot.SendMessageOptions) {
+        sent.push({ text, parseMode: options?.parse_mode });
+        return { message_id: sent.length } as TelegramBot.Message;
+      },
+    } as TelegramBot,
+    useCases: {
+      async getStatus() {
+        return {
+          ok: true,
+          value: {
+            mode: "idle",
+            projectId: undefined,
+            projectAlias: undefined,
+            sessionId: undefined,
+            activeTaskId: undefined,
+          },
+        };
+      },
+    } as unknown as ApplicationUseCases,
+    config: buildConfig({ compatLegacyTextBridge: true }),
+    callOpenCodeFn: async () => ({ answer: "**legacy** bridge" }),
+  });
+
+  await handler(createTelegramMessage("hola legacy"));
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.parseMode, "HTML");
+  assert.match(sent[0]?.text ?? "", /<b>legacy<\/b> bridge/);
 }
 
 async function verifyAdapterModeParsing(): Promise<void> {

@@ -193,7 +193,7 @@ Pre-digested rules per skill. Delegators copy matching blocks into sub-agent pro
 
 | File | Path | Notes |
 |------|------|-------|
-| AGENTS.md | /mnt/d/Proyectos/telegram-opencode/AGENTS.md | Index — references files below |
+| AGENTS.md | /mnt/d/Proyectos/telegram-opencode/AGENTS.md | Repository instructions — references files below |
 | Source entrypoint | /mnt/d/Proyectos/telegram-opencode/src/index.ts | Referenced by AGENTS.md |
 | Mock backend | /mnt/d/Proyectos/telegram-opencode/mock/opencode-mock.ts | Referenced by AGENTS.md |
 | Local start script | /mnt/d/Proyectos/telegram-opencode/start-local.js | Referenced by AGENTS.md |

@@ -242,3 +242,16 @@ Incorporar librería full-featured para convertir Markdown a Telegram.
 - ¿Las plantillas internas del bot deben marcarse explícitamente como “ya formateadas para Telegram” para evitar doble adaptación?
 - ¿Conviene degradar encabezados markdown a `<b>` o simplemente a texto limpio sin estilo?
 - ¿Los bloques de código largos deben priorizar `<pre>` o plain text para reducir fallos de parseo?
+
+## 15. Verificación manual sugerida
+
+Ejecutar `npm run start:local` y validar en Telegram estos casos representativos:
+
+- `**bold**`, `_italic_`, `` `inline code` `` y listas simples para confirmar que no se ven marcadores crudos.
+- bloque triple backtick corto y bloque largo para comprobar que `<pre>` se usa solo cuando sigue siendo seguro y que no hay mensajes rechazados.
+- links Markdown válidos e inválidos para confirmar click-through seguro o degradación a texto legible.
+- respuestas largas para verificar chunking numerado, sin entidades HTML partidas y con fallback plain text si Telegram rechaza parseo.
+- flujo bridge legacy y respuestas espejadas CLI para confirmar que ambos pasan por el mismo sender.
+- revisar consola/CLI local para confirmar que el cambio no altera comportamiento fuera de Telegram.
+- probar texto ambiguo como `_name_with_underscores_` para confirmar degradación segura a literal, sin itálica accidental.
+- probar payloads `telegram-native` y `plain` para confirmar bypass de adaptación Markdown y ausencia de doble transformación sobre plantillas HTML nativas.
