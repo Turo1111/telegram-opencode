@@ -1,0 +1,38 @@
+## Apply Progress — rfc3-hardening-verify-harness-coverage
+
+### Mode
+Standard (strict_tdd=false)
+
+### Batch Scope
+Batch 1 only — integrate SCN-LOM-001 determinism into `verify:rfc2` one-command harness.
+
+### Completed Tasks (cumulative)
+- [x] 1.1 Modificar `src/verification/rfc2-harness.ts` para declarar fixtures SCN-LOM (`UNSUPPORTED`, `TIMEOUT`, `UNAVAILABLE`) con expectativas `status/code` usando objeto `as const`.
+- [x] 1.2 En `src/verification/rfc2-harness.ts`, agregar helpers locales del escenario (servidor efímero + request runner) para ejecutar 2 corridas por fixture y comparar estabilidad de `status` y `code`.
+- [x] 1.3 Registrar `SCN-LOM-001` en `scenarioDefs` y en el summary final de `verify:rfc2`, asegurando pass/fail visible del escenario.
+- [x] 1.4 Ajustar salida de error en `src/verification/rfc2-harness.ts` para que, ante divergencia, identifique fixture y corrida, y marque falla total del comando.
+
+### Verification Evidence (non-build)
+1) `npm run verify:rfc2`
+- Resultado: **PASS**
+- Evidencia summary: `Summary: 20/20 passed`
+- Evidencia escenario: `✅ SCN-LOM-001 - Determinismo fixtures UNSUPPORTED/TIMEOUT/UNAVAILABLE`
+
+2) `RFC2_VERIFY_SCN_LOM_FORCE_DIVERGENCE=TIMEOUT npm run verify:rfc2`
+- Resultado: **FAIL esperado para validar visibilidad de divergencia**
+- Evidencia summary: `Summary: 19/20 passed`
+- Evidencia error accionable:
+  - `❌ SCN-LOM-001 - Determinismo fixtures UNSUPPORTED/TIMEOUT/UNAVAILABLE`
+  - `[SCN-LOM-001] fixture TIMEOUT run 2 mismatch: esperado status=504 code=TIMEOUT, recibido status=504 code=TIMEOUT_DRIFT`
+
+### Files Changed
+- `src/verification/rfc2-harness.ts` (modified)
+- `sdd/rfc3-hardening-verify-harness-coverage/apply-progress` (created)
+
+### Remaining Tasks
+- [ ] Batch 2 (2.1, 2.2, 2.3)
+- [ ] Batch 3 (3.1, 3.2, 3.3)
+
+### Notes
+- No deviations from design for Batch 1.
+- No changes applied to Batch 2/3 as requested.

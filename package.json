@@ -1,0 +1,38 @@
+{
+  "name": "telegram-opencode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bot de Telegram local que reenvía mensajes a OpenCode",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "mock": "ts-node mock/opencode-mock.ts",
+    "verify:rfc2": "ts-node src/verification/rfc2-harness.ts",
+    "verify:rfc2:coverage": "ts-node src/verification/rfc2-coverage.ts",
+    "verify:rfc2:coverage:negative": "ts-node src/verification/rfc2-coverage-negative.ts",
+    "verify:rfc2:policy": "ts-node src/verification/rfc2-manual-fallback-policy.ts",
+    "verify:rfc5": "ts-node src/verification/rfc5-boot-recovery.ts",
+    "verify:rfc6:concurrency": "ts-node src/verification/rfc6-concurrency.ts",
+    "verify:rfc6:policy": "ts-node src/verification/rfc6-policy-matrix.ts",
+    "verify:rfc6:recovery": "ts-node src/verification/rfc6-recovery-fifo.ts",
+    "verify:rfc6": "npm run verify:rfc6:concurrency && npm run verify:rfc6:policy && npm run verify:rfc6:recovery",
+    "verify:rfc7": "ts-node src/verification/rfc7-watcher.ts",
+    "verify:rfc8": "ts-node src/verification/rfc8-human-prompts.ts",
+    "verify:rfc9": "ts-node src/verification/rfc9-security-auth.ts",
+    "verify:rfc10": "ts-node src/verification/rfc10-cli-local-linking.ts",
+    "start:local": "node start-local.js",
+    "stop:local": "node stop-local.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.61.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/node-telegram-bot-api": "^0.61.6",
+    "c8": "^10.1.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
