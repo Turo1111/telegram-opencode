@@ -159,36 +159,42 @@ function shouldFallbackFromSanitizedExport(error: unknown): boolean {
 }
 
 export function parseOpenCodeCliSessionList(raw: string): readonly OpenCodeCliSessionListItem[] {
-   const parsed = parseJson(raw, "session list");
-   const rawItems = Array.isArray(parsed)
-     ? parsed
-     : isRecord(parsed) && Array.isArray(parsed.items)
-       ? parsed.items
-       : [];
+  const parsed = parseJson(raw, "session list");
+  const rawItems = Array.isArray(parsed)
+    ? parsed
+    : isRecord(parsed) && Array.isArray(parsed.items)
+      ? parsed.items
+      : [];
 
-   const items: OpenCodeCliSessionListItem[] = [];
+  const items: OpenCodeCliSessionListItem[] = [];
 
-   for (const item of rawItems) {
-     if (!isRecord(item)) {
-       continue;
-     }
+  for (const item of rawItems) {
+    if (!isRecord(item)) {
+      continue;
+    }
 
-     const id = readString(item.id) ?? readString(item.sessionId) ?? readString(item.session_id);
-     if (!id) {
-       continue;
-     }
+    const id = readString(item.id) ?? readString(item.sessionId) ?? readString(item.session_id);
+    if (!id) {
+      continue;
+    }
 
-     items.push({
-       id,
-       path: readString(item.path) ?? readString(item.dir),
-       title: readString(item.title) ?? readString(item.name),
-       model: readString(item.model),
-       createdAt: readString(item.createdAt) ?? readString(item.created_at),
-       updatedAt: readString(item.updatedAt) ?? readString(item.updated_at),
-     });
-   }
+    items.push({
+      id,
+      path: readString(item.path) ?? readString(item.dir) ?? readString(item.directory),
+      title: readString(item.title) ?? readString(item.name),
+      model: readString(item.model),
+      createdAt:
+        readTimestamp(item.createdAt) ??
+        readTimestamp(item.created_at) ??
+        readTimestamp(item.created),
+      updatedAt:
+        readTimestamp(item.updatedAt) ??
+        readTimestamp(item.updated_at) ??
+        readTimestamp(item.updated),
+    });
+  }
 
-   return items;
+  return items;
 }
 
 export function parseOpenCodeCliExport(sessionId: string, raw: string): OpenCodeCliExport {

@@ -20,6 +20,7 @@
     "verify:rfc8": "ts-node src/verification/rfc8-human-prompts.ts",
     "verify:rfc9": "ts-node src/verification/rfc9-security-auth.ts",
     "verify:rfc10": "ts-node src/verification/rfc10-cli-local-linking.ts",
+    "verify:rfc11": "ts-node src/verification/rfc11-local-runtime-sessions.ts",
     "start:local": "node start-local.js",
     "stop:local": "node stop-local.js"
   },

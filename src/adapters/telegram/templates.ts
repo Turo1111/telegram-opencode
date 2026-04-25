@@ -10,6 +10,7 @@ import {
   RECOVERY_REASON,
 } from "../../application/contracts";
 import { PendingPrompt, PENDING_PROMPT_STATUS, PROMPT_TYPE } from "../../domain/entities";
+import { ProjectSessionListItem } from "../../infrastructure/opencode-project-sessions";
 
 const FALLBACK_ERROR_MESSAGE = "Hubo un problema, probá de nuevo en unos segundos.";
 
@@ -79,7 +80,7 @@ export function formatProjectSelected(projectId: string, alias: string): string 
     lines: [
       `Alias: ${alias}`,
       `ID: ${projectId}`,
-      "Siguiente paso: vinculá una sesión con /session <id> o creala con /new si tu backend lo soporta.",
+      "Siguiente paso: usá /sesiones para elegir una sesión PTY/OpenCode del proyecto o vinculá una manualmente con /session <id>.",
     ],
   });
 }
@@ -93,7 +94,15 @@ export function formatSessionLinked(sessionId: string, projectId: string): strin
       session: sessionId,
       state: "session-linked",
     },
-    lines: ["Ya podés enviar texto libre o usar /status. Para cambiar de sesión, repetí /session <otro-id>."],
+    lines: ["Ya podés enviar mensajes a la sesión activa. Para cambiar de sesión, usá /sesiones o repetí /session <otro-id>."],
+  });
+}
+
+export function formatLegacyNewDisabled(): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.INFO,
+    title: "Comando deshabilitado",
+    lines: ["/new ya no forma parte del flujo PTY-only. Creá o continuá la sesión desde OpenCode y luego usá /sesiones o /session <id>."],
   });
 }
 
@@ -200,7 +209,7 @@ export function formatBusyCommandRejected(status: StatusOutput, command: string)
     },
     lines: [
       `El comando /${command} no se puede ejecutar mientras hay una tarea activa.`,
-      "Permitidos en busy: /status, /cancel, /project (sin argumentos).",
+      "Permitidos en busy: /status, /sesiones, /cancel, /project (sin argumentos).",
     ],
   });
 }
@@ -265,7 +274,7 @@ export function formatStatus(status: StatusOutput): string {
   if (!status.projectId) {
     lines.push("Siguiente paso: elegí proyecto con /project <alias|projectId>.");
   } else if (!status.sessionId) {
-    lines.push("Siguiente paso: vinculá sesión con /session <id> o creá una con /new.");
+    lines.push("Siguiente paso: elegí una sesión con /sesiones o vinculala manualmente con /session <id>.");
   }
 
   return renderUxBlock({
@@ -279,12 +288,64 @@ export function formatStatus(status: StatusOutput): string {
     lines: [
       ...lines,
       !status.projectId
-        ? "Flujo CLI: /project <path-local> → continuá/creá la sesión en PC/WSL → /session <id>."
+        ? "Flujo PTY: /project <path-local> → /sesiones → confirmá la vinculación."
         : !status.sessionId
-          ? "Si tu backend es CLI, vinculá una sesión existente creada/continuada desde PC/WSL con /session <id>."
+          ? "Sesión pendiente: usá /sesiones para ver sólo las sesiones OpenCode seguras del proyecto activo."
           : "",
     ].filter((line) => line.trim().length > 0),
   });
+}
+
+export function formatProjectSessionsRequireProject(): string {
+  return "🔴 Primero seleccioná un proyecto con /project <ruta> antes de listar sesiones.";
+}
+
+export function formatProjectSessions(projectPath: string, sessions: readonly ProjectSessionListItem[]): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.INFO,
+    title: "Sesiones del proyecto actual",
+    context: {
+      project: projectPath,
+      state: "session-selection",
+    },
+    lines: [
+      "Seleccioná una sesión para vincularla a este chat:",
+      ...sessions.map((session) => formatProjectSessionLine(session)),
+    ],
+  });
+}
+
+export function formatProjectSessionsEmpty(): string {
+  return "ℹ️ No encontré sesiones disponibles para el proyecto actual.";
+}
+
+export function formatProjectSessionsReadError(): string {
+  return "🔴 No pude consultar las sesiones de OpenCode. Verificá que el bridge PTY y OpenCode estén disponibles.";
+}
+
+export function formatProjectSessionConfirmation(projectPath: string, sessionId: string): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.NEEDS_ATTENTION,
+    title: "Confirmar vinculación",
+    context: {
+      project: projectPath,
+      session: sessionId,
+      state: "pending-confirmation",
+    },
+    lines: ["¿Querés vincular esta sesión a este chat?"],
+  });
+}
+
+export function formatProjectSessionCancelled(): string {
+  return "ℹ️ Vinculación cancelada. La sesión actual del chat no cambió.";
+}
+
+export function formatProjectSessionUnavailable(): string {
+  return "🔴 La sesión seleccionada ya no está disponible. Volvé a ejecutar /sesiones.";
+}
+
+export function formatProjectSessionMismatch(): string {
+  return "🔴 La sesión seleccionada no coincide con el proyecto activo de este chat.";
 }
 
 export function formatNoSessionGuide(status?: StatusOutput): string {
@@ -297,8 +358,8 @@ export function formatNoSessionGuide(status?: StatusOutput): string {
       state: status?.mode,
     },
     lines: [
-      "Primero elegí proyecto y sesión (/project, /session o /new).",
-      "Flujo CLI: /project <path-local> → continuá/creá la sesión en PC/WSL → /session <id>.",
+      "Primero elegí proyecto y sesión (/project + /sesiones o /session).",
+      "Flujo PTY: /project <path-local> → /sesiones → confirmá la vinculación.",
     ],
   });
 }
@@ -319,8 +380,8 @@ export function formatFreeTextRejectedBusy(status: StatusOutput): string {
 export function formatLegacyRunCmdDisabled(): string {
   return renderUxBlock({
     semantic: UX_SEMANTIC.INFO,
-    title: "Comando legado deshabilitado",
-    lines: ["/run y /cmd están desactivados por compatibilidad. Usá /help para ver el catálogo RFC-004."],
+    title: "Comando deshabilitado",
+    lines: ["/run y /cmd ya no forman parte del flujo PTY-only. Vinculá una sesión y usá texto libre en el chat."],
   });
 }
 
@@ -365,7 +426,7 @@ export function formatRecoveryNotice(notice: BootRecoveryNotice): string {
       lines: [
         "La sesión remota ya no estaba disponible y se desvinculó localmente.",
         `Motivo: ${formatRecoveryReason(notice.reason)}.`,
-        "Siguiente paso: abrí una sesión nueva con /new o vinculá otra con /session.",
+        "Siguiente paso: elegí otra sesión con /sesiones o vinculala manualmente con /session.",
       ],
     });
   }
@@ -610,9 +671,21 @@ export function formatDomainError(error: DomainError): string {
     title: "No se pudo completar la operación",
     lines: [
       message,
-      "Si seguís bloqueado: verificá /status y recuperá contexto con /project + /session o /new si tu backend lo soporta.",
+      "Si seguís bloqueado: verificá /status y recuperá contexto con /project + /sesiones o /session.",
     ],
   });
+}
+
+function formatProjectSessionLine(session: ProjectSessionListItem): string {
+  const metadata = [session.title, session.model, session.updatedAt].filter(
+    (value): value is string => typeof value === "string" && value.trim().length > 0
+  );
+
+  if (metadata.length === 0) {
+    return `• ${session.sessionId}`;
+  }
+
+  return `• ${session.sessionId} — ${metadata.join(" • ")}`;
 }
 
 export function formatUnknownError(): string {

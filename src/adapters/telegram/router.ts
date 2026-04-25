@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import TelegramBot from "node-telegram-bot-api";
 import {
   ApplicationUseCases,
@@ -14,16 +15,22 @@ import {
   formatCancelSuccess,
   formatCancelUnsupported,
   formatCommandCatalog,
+  formatLegacyNewDisabled,
   formatLegacyRunCmdDisabled,
-  formatLegacyRunCmdDeprecationNotice,
-  formatFreeTextRejectedBusy,
   formatDomainError,
+  formatFreeTextRejectedBusy,
   formatNoSessionGuide,
   formatProjectQuery,
+  formatProjectSessionCancelled,
+  formatProjectSessionConfirmation,
+  formatProjectSessionMismatch,
+  formatProjectSessions,
+  formatProjectSessionsEmpty,
+  formatProjectSessionsReadError,
+  formatProjectSessionsRequireProject,
+  formatProjectSessionUnavailable,
   formatProjectSelected,
-  formatRunCommandSuccess,
   formatSendSuccess,
-  formatSessionCreated,
   formatSessionLinked,
   formatPromptIdempotentNotice,
   formatPromptRequiresTextNotice,
@@ -36,6 +43,12 @@ import { logger } from "../../logger";
 import { sendTelegramText, TELEGRAM_CONTENT_KIND, TelegramContentKind } from "./message-sender";
 import { ADAPTER_ERROR_CODES } from "../../application/contracts";
 import { OPEN_CODE_ADAPTER_MODE, OpenCodeAdapterMode } from "../../infrastructure/opencode-adapter-mode";
+import {
+  inspectProjectSessions,
+  PROJECT_SESSION_ASSOCIATION,
+  PROJECT_SESSION_INSPECTION_RESULT_KIND,
+  selectSafeProjectSessions,
+} from "../../infrastructure/opencode-project-sessions";
 
 export interface TelegramRouterDeps {
   bot: TelegramBot;
@@ -43,6 +56,8 @@ export interface TelegramRouterDeps {
   persistence?: PersistenceDriver;
   compatRunCmdCommands: boolean;
   openCodeAdapterMode?: OpenCodeAdapterMode;
+  openCodeControlTimeoutMs?: number;
+  inspectProjectSessionsFn?: typeof inspectProjectSessions;
 }
 
 const CLI_CANCEL_UNSUPPORTED_GUIDANCE =
@@ -75,6 +90,7 @@ export interface TelegramRouterAuthContext {
 export const TELEGRAM_COMMAND_INTENT_KIND = {
   HELP: "help",
   STATUS: "status",
+  SESSIONS: "sessions",
   PROJECT: "project",
   SESSION: "session",
   NEW: "new",
@@ -118,6 +134,7 @@ export type TelegramRouteDecision = (typeof TELEGRAM_ROUTE_DECISION)[keyof typeo
 
 const COMMAND_INTENT_POLICY = {
   [TELEGRAM_COMMAND_INTENT_KIND.STATUS]: COMMAND_POLICY.READ_ONLY,
+  [TELEGRAM_COMMAND_INTENT_KIND.SESSIONS]: COMMAND_POLICY.READ_ONLY,
   [TELEGRAM_COMMAND_INTENT_KIND.CANCEL]: COMMAND_POLICY.READ_ONLY,
   [TELEGRAM_COMMAND_INTENT_KIND.PROJECT]: COMMAND_POLICY.READ_ONLY,
   [TELEGRAM_COMMAND_INTENT_KIND.SESSION]: COMMAND_POLICY.EXECUTION,
@@ -132,6 +149,7 @@ const COMMAND_ALIASES = {
   help: TELEGRAM_COMMAND_INTENT_KIND.HELP,
   status: TELEGRAM_COMMAND_INTENT_KIND.STATUS,
   st: TELEGRAM_COMMAND_INTENT_KIND.STATUS,
+  sesiones: TELEGRAM_COMMAND_INTENT_KIND.SESSIONS,
   project: TELEGRAM_COMMAND_INTENT_KIND.PROJECT,
   p: TELEGRAM_COMMAND_INTENT_KIND.PROJECT,
   session: TELEGRAM_COMMAND_INTENT_KIND.SESSION,
@@ -147,13 +165,43 @@ const COMMAND_ALIASES = {
 const COMMAND_CATALOG = [
   "/start | /help",
   "/status | /st",
+  "/sesiones",
   "/project | /p <alias|projectId>",
   "/session | /s <sessionId>",
-  "/new | /n",
   "/cancel | /c",
 ] as const;
 
+const DEFAULT_OPEN_CODE_CONTROL_TIMEOUT_MS = 5_000;
+const SESSION_SELECTION_CALLBACK_PREFIX = "sess";
+const SESSION_SELECTION_CALLBACK_ACTION = {
+  SELECT: "sel",
+  CONFIRM: "ok",
+  CANCEL: "no",
+} as const;
+
+type SessionSelectionCallbackAction =
+  (typeof SESSION_SELECTION_CALLBACK_ACTION)[keyof typeof SESSION_SELECTION_CALLBACK_ACTION];
+
+interface SessionSelectionCallbackPayload {
+  readonly action: SessionSelectionCallbackAction;
+  readonly token: string;
+}
+
+interface SessionSelectionTokenRecord {
+  readonly chatId: string;
+  readonly projectId: string;
+  readonly projectPath: string;
+  readonly sessionId: string;
+  readonly createdAt: number;
+}
+
+// Telegram limits callback_data to 64 bytes. We keep the public payload short
+// (`sess:<action>:<token>`) and store the project/session binding in memory so
+// the confirm step can still revalidate against the active project context.
+
 export function createTelegramRouter(deps: TelegramRouterDeps) {
+  const sessionSelectionTokens = new Map<string, SessionSelectionTokenRecord>();
+
   return {
     async handleMessage(msg: TelegramBot.Message, authContext?: TelegramRouterAuthContext): Promise<void> {
       if (shouldDefensivelyRejectByAuthContext(authContext, "message", String(msg.chat.id))) {
@@ -166,7 +214,7 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
       const chatId = String(msg.chat.id);
 
       if (text.startsWith("/")) {
-        await handleCommand(deps, chatId, text);
+        await handleCommand(deps, chatId, text, sessionSelectionTokens);
         return;
       }
 
@@ -182,8 +230,20 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
         return;
       }
 
-      const parsed = parsePromptCallbackPayload(query.data);
-      if (!parsed) {
+      const parsedSessionCallback = parseSessionSelectionCallbackPayload(query.data);
+      if (parsedSessionCallback) {
+        await handleSessionSelectionCallback({
+          deps,
+          chatId,
+          query,
+          payload: parsedSessionCallback,
+          sessionSelectionTokens,
+        });
+        return;
+      }
+
+      const parsedPromptCallback = parsePromptCallbackPayload(query.data);
+      if (!parsedPromptCallback) {
         await deps.bot.answerCallbackQuery(query.id, {
           text: "Acción inválida o desactualizada.",
           show_alert: false,
@@ -194,7 +254,7 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
       logger.info("Telegram route decision", {
         chatId,
         routeDecision: TELEGRAM_ROUTE_DECISION.CALLBACK_QUERY,
-        promptId: parsed.promptId,
+        promptId: parsedPromptCallback.promptId,
         event: "telegram-callback-query",
         status: "received",
       });
@@ -208,13 +268,13 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
       }
 
       const prompt = await deps.persistence.runInTransaction((unit: PersistenceUnit) =>
-        unit.pendingPrompts.findByPromptId(parsed.promptId)
+        unit.pendingPrompts.findByPromptId(parsedPromptCallback.promptId)
       );
       if (!prompt) {
         logger.prompt("Telegram callback ignored: prompt not found", {
           session_id: undefined,
           chat_id: chatId,
-          prompt_id: parsed.promptId,
+          prompt_id: parsedPromptCallback.promptId,
           event: "telegram-callback-query",
           status: "not-found",
           reason: "prompt-missing",
@@ -230,7 +290,7 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
         logger.prompt("Telegram callback ignored (idempotent)", {
           session_id: prompt.sessionId,
           chat_id: chatId,
-          prompt_id: parsed.promptId,
+          prompt_id: parsedPromptCallback.promptId,
           event: "telegram-callback-query",
           status: prompt.status,
           reason: "prompt-not-active",
@@ -251,7 +311,7 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
         logger.prompt("Telegram callback rejected: prompt requires text", {
           session_id: prompt.sessionId,
           chat_id: chatId,
-          prompt_id: parsed.promptId,
+          prompt_id: parsedPromptCallback.promptId,
           event: "telegram-callback-query",
           status: prompt.status,
           reason: "prompt-type-text",
@@ -272,7 +332,7 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
         logger.prompt("Telegram callback ignored: duplicate callback query", {
           session_id: prompt.sessionId,
           chat_id: chatId,
-          prompt_id: parsed.promptId,
+          prompt_id: parsedPromptCallback.promptId,
           event: "telegram-callback-query",
           status: prompt.status,
           reason: "duplicate-callback",
@@ -294,8 +354,8 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
       const submitResult = await deps.useCases.submitPendingPrompt({
         chatId,
         sessionId: prompt.sessionId,
-        promptId: parsed.promptId,
-        choice: parsed.choice,
+        promptId: parsedPromptCallback.promptId,
+        choice: parsedPromptCallback.choice,
         callbackQueryId: query.id,
       });
 
@@ -303,7 +363,7 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
         logger.prompt("Telegram callback submit failed", {
           session_id: prompt.sessionId,
           chat_id: chatId,
-          prompt_id: parsed.promptId,
+          prompt_id: parsedPromptCallback.promptId,
           event: "telegram-callback-query",
           status: "submit-error",
           reason: submitResult.error.code,
@@ -381,7 +441,12 @@ function shouldDefensivelyRejectByAuthContext(
   return true;
 }
 
-async function handleCommand(deps: TelegramRouterDeps, chatId: string, text: string): Promise<void> {
+async function handleCommand(
+  deps: TelegramRouterDeps,
+  chatId: string,
+  text: string,
+  sessionSelectionTokens: Map<string, SessionSelectionTokenRecord>
+): Promise<void> {
   const intent = parseCommandIntent(text);
   const policy = resolveCommandPolicy(intent);
   const numericChatId = Number(chatId);
@@ -433,6 +498,53 @@ async function handleCommand(deps: TelegramRouterDeps, chatId: string, text: str
       return;
     }
 
+    if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.SESSIONS) {
+      const activeProject = await loadActiveProjectContext(deps.persistence, chatId);
+      if (!activeProject) {
+        await send(formatProjectSessionsRequireProject());
+        return;
+      }
+
+      const inspection = await (deps.inspectProjectSessionsFn ?? inspectProjectSessions)({
+        projectPath: activeProject.rootPath,
+        timeoutMs: deps.openCodeControlTimeoutMs ?? DEFAULT_OPEN_CODE_CONTROL_TIMEOUT_MS,
+      });
+
+      if (inspection.kind === PROJECT_SESSION_INSPECTION_RESULT_KIND.ERROR) {
+        await send(formatProjectSessionsReadError());
+        return;
+      }
+
+      const sessions = selectSafeProjectSessions(inspection);
+      if (sessions.length === 0) {
+        await send(formatProjectSessionsEmpty());
+        return;
+      }
+
+      const keyboard = {
+        inline_keyboard: sessions.map((session) => {
+          const token = registerSessionSelectionToken(sessionSelectionTokens, {
+            chatId,
+            projectId: activeProject.projectId,
+            projectPath: inspection.projectPath,
+            sessionId: session.sessionId,
+          });
+
+          return [
+            {
+              text: session.title?.trim() ? `${session.sessionId} · ${session.title.trim()}` : session.sessionId,
+              callback_data: buildSessionSelectionCallbackData(SESSION_SELECTION_CALLBACK_ACTION.SELECT, token),
+            },
+          ];
+        }),
+      } satisfies TelegramBot.InlineKeyboardMarkup;
+
+      await deps.bot.sendMessage(numericChatId, formatProjectSessions(inspection.projectPath, sessions), {
+        reply_markup: keyboard,
+      });
+      return;
+    }
+
     if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.SESSION) {
       if (!intent.args) {
         await send(formatUsage("session"));
@@ -454,14 +566,7 @@ async function handleCommand(deps: TelegramRouterDeps, chatId: string, text: str
     }
 
     if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.NEW) {
-      const result = await deps.useCases.createSession({ chatId });
-
-      if (!result.ok) {
-        await send(formatDomainError(result.error));
-        return;
-      }
-
-      await send(formatSessionCreated(result.value.sessionId, result.value.projectId));
+      await send(formatLegacyNewDisabled());
       return;
     }
 
@@ -511,30 +616,7 @@ async function handleCommand(deps: TelegramRouterDeps, chatId: string, text: str
     }
 
     if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.RUN) {
-      if (!deps.compatRunCmdCommands) {
-        await send(formatLegacyRunCmdDisabled());
-        return;
-      }
-
-      if (!intent.args) {
-        await send("Uso: /run <comando>. Alias: /cmd <comando>");
-        return;
-      }
-
-      const result = await deps.useCases.runSessionCommand({
-        chatId,
-        command: intent.args,
-      });
-
-      if (!result.ok) {
-        await send(formatDomainError(result.error));
-        return;
-      }
-
-      await send(
-        `${formatLegacyRunCmdDeprecationNotice()}\n\n${formatRunCommandSuccess(result.value)}`,
-        TELEGRAM_CONTENT_KIND.MODEL
-      );
+      await send(formatLegacyRunCmdDisabled());
       return;
     }
 
@@ -717,6 +799,233 @@ async function handleText(deps: TelegramRouterDeps, chatId: string, text: string
       contentKind: TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE,
     });
   }
+}
+
+async function handleSessionSelectionCallback(input: {
+  readonly deps: TelegramRouterDeps;
+  readonly chatId: string;
+  readonly query: TelegramBot.CallbackQuery;
+  readonly payload: SessionSelectionCallbackPayload;
+  readonly sessionSelectionTokens: Map<string, SessionSelectionTokenRecord>;
+}): Promise<void> {
+  const selection = takeSessionSelectionToken(input.sessionSelectionTokens, input.payload.token);
+  if (!selection || selection.chatId !== input.chatId) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "Acción inválida o desactualizada.",
+      show_alert: false,
+    });
+    return;
+  }
+
+  const activeProject = await loadActiveProjectContext(input.deps.persistence, input.chatId);
+  if (!activeProject || activeProject.projectId !== selection.projectId || activeProject.rootPath !== selection.projectPath) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "Proyecto activo cambiado.",
+      show_alert: false,
+    });
+    await sendTelegramText({
+      bot: input.deps.bot,
+      chatId: Number(input.chatId),
+      text: formatProjectSessionMismatch(),
+    });
+    return;
+  }
+
+  if (input.payload.action === SESSION_SELECTION_CALLBACK_ACTION.SELECT) {
+    const confirmToken = registerSessionSelectionToken(input.sessionSelectionTokens, selection);
+    const cancelToken = registerSessionSelectionToken(input.sessionSelectionTokens, selection);
+
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: `Sesión elegida: ${selection.sessionId}`,
+      show_alert: false,
+    });
+    await input.deps.bot.sendMessage(Number(input.chatId), formatProjectSessionConfirmation(selection.projectPath, selection.sessionId), {
+      reply_markup: {
+        inline_keyboard: [[
+          {
+            text: "Confirmar",
+            callback_data: buildSessionSelectionCallbackData(SESSION_SELECTION_CALLBACK_ACTION.CONFIRM, confirmToken),
+          },
+          {
+            text: "Cancelar",
+            callback_data: buildSessionSelectionCallbackData(SESSION_SELECTION_CALLBACK_ACTION.CANCEL, cancelToken),
+          },
+        ]],
+      },
+    });
+    return;
+  }
+
+  if (input.payload.action === SESSION_SELECTION_CALLBACK_ACTION.CANCEL) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "Vinculación cancelada.",
+      show_alert: false,
+    });
+    await sendTelegramText({
+      bot: input.deps.bot,
+      chatId: Number(input.chatId),
+      text: formatProjectSessionCancelled(),
+    });
+    return;
+  }
+
+  const inspection = await (input.deps.inspectProjectSessionsFn ?? inspectProjectSessions)({
+    projectPath: selection.projectPath,
+    timeoutMs: input.deps.openCodeControlTimeoutMs ?? DEFAULT_OPEN_CODE_CONTROL_TIMEOUT_MS,
+  });
+  if (inspection.kind === PROJECT_SESSION_INSPECTION_RESULT_KIND.ERROR) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "No pude consultar OpenCode.",
+      show_alert: false,
+    });
+    await sendTelegramText({
+      bot: input.deps.bot,
+      chatId: Number(input.chatId),
+      text: formatProjectSessionsReadError(),
+    });
+    return;
+  }
+
+  const targetSession = inspection.sessions.find((session) => session.sessionId === selection.sessionId);
+  if (!targetSession) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "La sesión ya no existe.",
+      show_alert: false,
+    });
+    await sendTelegramText({
+      bot: input.deps.bot,
+      chatId: Number(input.chatId),
+      text: formatProjectSessionUnavailable(),
+    });
+    return;
+  }
+
+  if (targetSession.association !== PROJECT_SESSION_ASSOCIATION.MATCH) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "La sesión ya no coincide con el proyecto.",
+      show_alert: false,
+    });
+    await sendTelegramText({
+      bot: input.deps.bot,
+      chatId: Number(input.chatId),
+      text: formatProjectSessionMismatch(),
+    });
+    return;
+  }
+
+  const result = await input.deps.useCases.attachSession({
+    chatId: input.chatId,
+    sessionId: selection.sessionId,
+  });
+  if (!result.ok) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "No pude vincular la sesión.",
+      show_alert: false,
+    });
+    await sendTelegramText({
+      bot: input.deps.bot,
+      chatId: Number(input.chatId),
+      text: formatDomainError(result.error),
+    });
+    return;
+  }
+
+  await input.deps.bot.answerCallbackQuery(input.query.id, {
+    text: "Sesión vinculada.",
+    show_alert: false,
+  });
+  await sendTelegramText({
+    bot: input.deps.bot,
+    chatId: Number(input.chatId),
+    text: formatSessionLinked(result.value.sessionId, result.value.projectId),
+  });
+}
+
+async function loadActiveProjectContext(
+  persistence: PersistenceDriver | undefined,
+  chatId: string
+): Promise<{ projectId: string; rootPath: string } | undefined> {
+  if (!persistence) {
+    return undefined;
+  }
+
+  return persistence.runInTransaction(async (unit: PersistenceUnit) => {
+    const binding = await unit.bindings.findByChatId(chatId);
+    if (!binding?.activeProjectId) {
+      return undefined;
+    }
+
+    const project = await unit.projects.findById(binding.activeProjectId);
+    if (!project) {
+      return undefined;
+    }
+
+    return {
+      projectId: project.projectId,
+      rootPath: project.rootPath,
+    };
+  });
+}
+
+function registerSessionSelectionToken(
+  tokens: Map<string, SessionSelectionTokenRecord>,
+  selection: Omit<SessionSelectionTokenRecord, "createdAt">
+): string {
+  purgeExpiredSessionSelectionTokens(tokens);
+  const token = randomUUID().replace(/-/gu, "").slice(0, 12);
+  tokens.set(token, {
+    ...selection,
+    createdAt: Date.now(),
+  });
+  return token;
+}
+
+function takeSessionSelectionToken(
+  tokens: Map<string, SessionSelectionTokenRecord>,
+  token: string
+): SessionSelectionTokenRecord | undefined {
+  purgeExpiredSessionSelectionTokens(tokens);
+  const selection = tokens.get(token);
+  if (!selection) {
+    return undefined;
+  }
+
+  tokens.delete(token);
+  return selection;
+}
+
+function purgeExpiredSessionSelectionTokens(tokens: Map<string, SessionSelectionTokenRecord>): void {
+  const expirationTime = Date.now() - 15 * 60 * 1000;
+  for (const [token, selection] of tokens.entries()) {
+    if (selection.createdAt < expirationTime) {
+      tokens.delete(token);
+    }
+  }
+}
+
+function buildSessionSelectionCallbackData(action: SessionSelectionCallbackAction, token: string): string {
+  return `${SESSION_SELECTION_CALLBACK_PREFIX}:${action}:${token}`;
+}
+
+function parseSessionSelectionCallbackPayload(data: string | undefined): SessionSelectionCallbackPayload | undefined {
+  if (!data || !data.startsWith(`${SESSION_SELECTION_CALLBACK_PREFIX}:`)) {
+    return undefined;
+  }
+
+  const [prefix, action, token] = data.split(":");
+  if (
+    prefix !== SESSION_SELECTION_CALLBACK_PREFIX ||
+    !action ||
+    !token ||
+    !Object.values(SESSION_SELECTION_CALLBACK_ACTION).includes(action as SessionSelectionCallbackAction)
+  ) {
+    return undefined;
+  }
+
+  return {
+    action: action as SessionSelectionCallbackAction,
+    token,
+  };
 }
 
 function parsePromptCallbackPayload(data: string | undefined): { promptId: string; choice: string } | undefined {

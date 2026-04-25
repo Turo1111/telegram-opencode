@@ -1,7 +1,7 @@
 import TelegramBot from "node-telegram-bot-api";
 import { Config } from "./config";
 import { logger, LOCK_OUTCOME, LockOutcome } from "./logger";
-import { createCallbackQueryHandler, createMessageHandler } from "./handlers";
+import { createTelegramHandlers } from "./handlers";
 import { ApplicationUseCases } from "./application/use-cases";
 import { ChatLockManager, createChatLockManager } from "./application/chat-lock-manager";
 import { PersistenceDriver } from "./application/contracts";
@@ -309,8 +309,12 @@ export function startBot(deps: StartBotDeps): TelegramBot {
     request: { family: 4 } as unknown as TelegramBot.ConstructorOptions["request"],
   });
 
-  const messageHandler = createMessageHandler({ bot, useCases, persistence, config });
-  const callbackQueryHandler = createCallbackQueryHandler({ bot, useCases, persistence, config });
+  const { messageHandler, callbackQueryHandler } = createTelegramHandlers({
+    bot,
+    useCases,
+    persistence,
+    config,
+  });
 
   registerTelegramIngress({
     bot,

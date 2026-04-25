@@ -1,47 +1,44 @@
 # Telegram OpenCode Bot
 
-Bot local de Telegram que recibe mensajes, los reenvía a OpenCode y devuelve la respuesta al chat. Está pensado para correr en tu máquina y permitirte operar OpenCode desde Telegram, con distintos modos de integración según tu flujo.
+Bot local de Telegram para operar sesiones reales de OpenCode desde Telegram.
+
+**Estado actual:** este README documenta solamente el flujo soportado **PTY-only**. El repositorio puede conservar compatibilidades o scripts legacy, pero NO forman parte del flujo principal documentado acá.
 
 ## Qué hace este proyecto
 
 - Recibe mensajes por **long polling** de Telegram.
-- Restringe el acceso por **allowlist de Telegram `from.id`**.
-- Reenvía prompts a OpenCode por uno de estos modos:
-  - **HTTP**: contra un backend HTTP o el mock local.
-  - **CLI**: vincula Telegram con una sesión real de OpenCode creada desde tu PC/WSL.
-  - **PTY**: usa `tmux` para compartir una sesión real viva entre Telegram y tu terminal.
-- Responde en **español**.
+- Restringe el acceso por **allowlist** de Telegram `from.id`.
+- Consulta sesiones reales de OpenCode para el proyecto activo.
+- Permite vincular una sesión desde Telegram con `/sesiones` + confirmación.
+- Reenvía texto libre a la sesión activa ya vinculada.
 - Mantiene estado local en `data/`.
+- Responde en **español**.
+
+## Flujo operativo soportado
+
+1. Abrís o continuás una sesión real de OpenCode desde tu máquina/WSL.
+2. Corrés este bot localmente.
+3. En Telegram seleccionás el proyecto activo con `/project <ruta-local>`.
+4. Ejecutás `/sesiones`, elegís una sesión real del proyecto y confirmás la vinculación.
+5. Desde ese momento mandás texto libre al chat y el bot lo reenvía a la sesión activa.
+
+La fuente de verdad del listado es OpenCode CLI:
+
+```bash
+opencode session list --format json
+```
+
+No se listan procesos locales del wrapper. Se listan sesiones reales de OpenCode asociables de forma segura al proyecto activo.
 
 ## Arquitectura general
 
 1. **Telegram** entrega updates al bot.
-2. **Este proceso Node.js** valida si vos estás autorizado.
-3. Si el mensaje es válido, lo manda a **OpenCode**.
-4. La respuesta vuelve y el bot te la manda por Telegram.
+2. **Este proceso Node.js** valida que el usuario esté autorizado.
+3. El bot resuelve el **proyecto activo** del chat.
+4. Para `/sesiones`, consulta OpenCode CLI y filtra por el árbol del proyecto activo.
+5. Para texto libre, reenvía el mensaje a la sesión PTY ya vinculada.
 
-No hay magia: hay un adaptador de entrada (Telegram), una capa de aplicación, persistencia local y un adaptador de salida hacia OpenCode.
-
-## Quick start
-
-Si querés ponerlo a funcionar lo antes posible:
-
-1. Creá un bot con **@BotFather**.
-2. Obtené tu **Telegram `from.id`**.
-3. Copiá `.env.example` a `.env` y completá `TELEGRAM_BOT_TOKEN` + `ALLOWED_USER_ID`.
-4. Instalá dependencias:
-
-```bash
-npm install
-```
-
-5. Para probar el flujo más simple, usá modo mock:
-
-```bash
-npm run start:local
-```
-
-6. Abrí Telegram, hablale a tu bot y verificá la respuesta.
+No hay magia: hay un adaptador de entrada (Telegram), una capa de aplicación, persistencia local y un adaptador hacia OpenCode.
 
 ## Requisitos
 
@@ -49,111 +46,31 @@ npm run start:local
 - **npm**
 - Un **bot de Telegram** propio
 - Tu **Telegram `from.id`**
+- `opencode` disponible en `PATH`
+- `tmux` disponible en `PATH`
 
-Según el modo que uses:
+### Requisito importante de paths
 
-- **Modo HTTP/mock**: no necesitás `opencode` instalado.
-- **Modo CLI**: necesitás `opencode` en `PATH`.
-- **Modo PTY**: necesitás `opencode` y `tmux` en `PATH`.
+La ruta del proyecto debe existir y ser visible IGUAL para Node y para OpenCode.
+
+Si usás WSL, pasá rutas Linux/WSL, por ejemplo:
+
+```text
+/mnt/d/Proyectos/mi-proyecto
+```
+
+No uses rutas Windows tipo `C:\mi-proyecto` dentro del flujo PTY.
 
 ## Instalación
 
 ```bash
 npm install
-```
-
-## Paso 1: crear tu bot de Telegram
-
-Esto se hace con **@BotFather**.
-
-1. Abrí Telegram.
-2. Buscá **@BotFather**.
-3. Enviá `/newbot`.
-4. BotFather te va a pedir:
-   - un **nombre visible** para el bot;
-   - un **username** que termine en `bot`.
-5. Cuando termine, BotFather te devuelve un mensaje con el **token HTTP API**.
-
-Ese token es el valor que va en:
-
-```bash
-TELEGRAM_BOT_TOKEN=<tu_token>
-```
-
-### Cómo obtener de nuevo el token
-
-Si lo perdés:
-
-1. Volvé a **@BotFather**.
-2. Ejecutá `/mybots`.
-3. Elegí tu bot.
-4. Entrá en **API Token**.
-
-## Paso 2: obtener tu Telegram ID
-
-Este proyecto **NO autoriza por `chat.id`**, autoriza por **`from.id`** del usuario real. Eso es importante.
-
-La forma más práctica:
-
-1. En Telegram, escribile a un bot como **@userinfobot**.
-2. Copiá el campo **Id**.
-
-Ese valor va en:
-
-```bash
-ALLOWED_USER_ID=<tu_id_numerico>
-```
-
-Si querés varios usuarios permitidos:
-
-```bash
-ALLOWED_USER_ID=123456789
-ALLOWED_USER_IDS=111111111,222222222
-```
-
-### Regla importante de seguridad
-
-- `ALLOWED_USER_ID` es **obligatoria**.
-- Tiene que ser un número válido.
-- Si ponés un placeholder o un valor inválido, el proceso falla al arrancar.
-- Usuarios no autorizados reciben **silent-drop**: el bot no responde.
-
-## Paso 3: crear tu archivo `.env`
-
-Usá `.env.example` como base:
-
-```bash
 cp .env.example .env
 ```
 
 Después editá `.env` con tus valores reales.
 
-### Configuración mínima para modo HTTP/mock
-
-```bash
-TELEGRAM_BOT_TOKEN=<tu_token_de_botfather>
-ALLOWED_USER_ID=<tu_telegram_from_id>
-
-OPEN_CODE_ADAPTER=http
-OPEN_CODE_URL=http://localhost:3000/opencode/query
-OPEN_CODE_TOKEN=dev-token
-
-LOCALE=es
-```
-
-### Configuración mínima para modo CLI
-
-```bash
-TELEGRAM_BOT_TOKEN=<tu_token_de_botfather>
-ALLOWED_USER_ID=<tu_telegram_from_id>
-
-OPEN_CODE_ADAPTER=cli
-LOCALE=es
-```
-
-En modo `cli`, `OPEN_CODE_URL` y `OPEN_CODE_TOKEN` pueden omitirse.
-
-### Configuración mínima para modo PTY
+## Configuración mínima
 
 ```bash
 TELEGRAM_BOT_TOKEN=<tu_token_de_botfather>
@@ -163,132 +80,102 @@ OPEN_CODE_ADAPTER=pty
 LOCALE=es
 ```
 
-## Variables importantes
-
-Estas son las más relevantes para que entiendas qué estás tocando:
+### Variables importantes
 
 - `TELEGRAM_BOT_TOKEN`: token de tu bot.
 - `ALLOWED_USER_ID`: usuario principal autorizado.
 - `ALLOWED_USER_IDS`: usuarios extra autorizados, separados por coma.
-- `OPEN_CODE_ADAPTER`: `http`, `cli` o `pty`.
-- `OPEN_CODE_URL`: endpoint HTTP de OpenCode cuando usás modo `http`.
-- `OPEN_CODE_TOKEN`: bearer token para el backend HTTP.
+- `OPEN_CODE_ADAPTER`: debe ser `pty` en el flujo soportado.
 - `OPEN_CODE_TIMEOUT_MS`: timeout general hacia OpenCode.
+- `OPEN_CODE_CONTROL_TIMEOUT_MS`: timeout para operaciones de control, como listar sesiones.
 - `POLLING_INTERVAL_MS`: intervalo del polling de Telegram.
 - `STATE_DRIVER`: `sqlite` o `json`.
 - `STATE_DB_PATH`: por defecto `./data/telegram-opencode.sqlite`.
 - `STATE_JSON_PATH`: por defecto `./data/telegram-opencode-state.json`.
 - `LOCALE`: en v1 queda en `es`.
 
-El archivo `.env.example` ya trae una plantilla completa con defaults razonables.
+## Quick start
 
-## Modos de funcionamiento
-
-## 1) Modo HTTP con mock local
-
-Este es el punto de entrada más fácil para probar que TODO el cableado funciona.
-
-### Qué hace
-
-- Levanta un backend mock local.
-- El bot le pega por HTTP.
-- El mock responde con una respuesta falsa para validar el flujo.
-
-### Cómo levantarlo
-
-Tenés dos opciones.
-
-#### Opción A: todo junto
-
-```bash
-npm run start:local
-```
-
-Eso levanta:
-
-- `npm run mock`
-- `npm run dev`
-
-Si quedó una instancia previa registrada:
-
-```bash
-npm run stop:local
-```
-
-#### Opción B: procesos separados
-
-Terminal 1:
-
-```bash
-npm run mock
-```
-
-Terminal 2:
+1. Creá un bot con **@BotFather**.
+2. Obtené tu **Telegram `from.id`**.
+3. Configurá `.env` con `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_ID` y `OPEN_CODE_ADAPTER=pty`.
+4. Instalá dependencias con `npm install`.
+5. Abrí o continuá una sesión real de OpenCode desde tu terminal.
+6. Corré el bot:
 
 ```bash
 npm run dev
 ```
 
-### Cuándo usar este modo
-
-- Cuando querés validar Telegram + auth + configuración.
-- Cuando todavía no querés conectar OpenCode real.
-- Cuando querés testear local sin dependencias externas.
-
-## 2) Modo CLI
-
-Este modo conecta Telegram con una sesión real de OpenCode que ya corrés desde PC/WSL.
-
-### Requisitos extra
-
-- `opencode` instalado y visible en `PATH`.
-- El path del proyecto debe existir y ser visible IGUAL para Node y OpenCode.
-- Si usás WSL, pasá rutas Linux/WSL como `/home/...` o `/mnt/d/...`.
-
-### Flujo correcto
-
-1. En tu PC/WSL abrís OpenCode.
-2. Creás o continuás una sesión desde OpenCode.
-3. En Telegram ejecutás:
+7. En Telegram:
 
 ```text
-/project <path-local-del-proyecto>
-/session <session-id-existente>
+/project <ruta-local>
+/sesiones
 ```
 
-4. Después de eso ya podés mandar texto libre por Telegram.
+8. Elegí la sesión, confirmá y empezá a mandar texto libre.
 
-### Importante
+## Comandos de Telegram disponibles
 
-En modo `cli`:
+- `/start` o `/help`
+- `/status` o `/st`
+- `/project` o `/p <ruta-local|alias|projectId>`
+- `/sesiones`
+- `/session` o `/s <sessionId>`
+- `/cancel` o `/c`
+- texto libre
 
-- `/new` no crea sesiones desde Telegram.
-- `/cancel` no tiene paridad completa desde Telegram.
-- La gestión principal de sesión sigue viviendo en PC/WSL.
+### Comandos y flujos fuera de foco
 
-O sea: Telegram se vuelve una extensión operativa de tu sesión real, no un reemplazo total.
+- `/new` está deshabilitado en el flujo PTY-only.
+- `/run` está deshabilitado en el flujo PTY-only.
+- El README NO documenta `mock`, `start:local` ni flujos HTTP/CLI como operación soportada.
 
-## 3) Modo PTY
-
-Este es el modo más potente. Corre OpenCode dentro de una sesión `tmux`, y Telegram + tu terminal comparten la misma sesión viva.
-
-### Requisitos extra
-
-- `opencode` en `PATH`
-- `tmux` en `PATH`
-
-### Flujo
-
-En Telegram:
+### Flujo recomendado en Telegram
 
 ```text
-/project <path-local-del-proyecto>
-/session <opencode_session_id>
+/project <ruta-local>
+/sesiones
 ```
 
-Después mandás texto y el bot lo inyecta en la sesión compartida.
+Después elegís una sesión real del proyecto, confirmás la vinculación y ya podés mandar texto libre.
 
-### Adjuntarte desde PC a la misma sesión
+### Fallback manual
+
+Si ya conocés el `sessionId`, podés vincularlo manualmente con:
+
+```text
+/session <sessionId>
+```
+
+## UX esperada
+
+### Sin proyecto activo
+
+```text
+🔴 Primero seleccioná un proyecto con /project <ruta> antes de listar sesiones.
+```
+
+### Sin sesiones seguras para el proyecto
+
+```text
+ℹ️ No encontré sesiones disponibles para el proyecto actual.
+```
+
+### Error consultando OpenCode
+
+```text
+🔴 No pude consultar las sesiones de OpenCode. Verificá que el bridge PTY y OpenCode estén disponibles.
+```
+
+### Vinculación exitosa
+
+```text
+🟢 Sesión vinculada
+```
+
+## Adjuntarte desde PC a la misma sesión
 
 El nombre de la sesión `tmux` queda así:
 
@@ -302,46 +189,16 @@ Ejemplo:
 tmux attach -t tgoc_mi-session-123
 ```
 
-## Comandos de Telegram disponibles
+## Scripts útiles
 
-- `/start` o `/help`
-- `/status` o `/st`
-- `/project` o `/p <alias|projectId>`
-- `/session` o `/s <sessionId>`
-- `/new` o `/n`
-- `/cancel` o `/c`
-
-## Flujo recomendado de punta a punta
-
-Si querés ir a lo seguro, hacé esto:
-
-1. Creá el bot con BotFather.
-2. Obtené tu `from.id`.
-3. Creá `.env` con `TELEGRAM_BOT_TOKEN` y `ALLOWED_USER_ID`.
-4. Elegí modo:
-   - mock local: `OPEN_CODE_ADAPTER=http`
-   - OpenCode real por CLI: `OPEN_CODE_ADAPTER=cli`
-   - OpenCode real compartido con tmux: `OPEN_CODE_ADAPTER=pty`
-5. Instalá dependencias con `npm install`.
-6. Levantá el proyecto:
-   - mock: `npm run start:local`
-   - bot solo: `npm run dev`
-7. Abrí Telegram y hablale a tu bot.
-8. Si usás CLI o PTY, primero asociá proyecto y sesión con `/project` y `/session`.
-
-Es así de simple, pero SOLO si entendés qué modo estás usando.
-
-## Scripts disponibles
+Flujo principal:
 
 ```bash
 npm install
 npm run dev
-npm run mock
-npm run start:local
-npm run stop:local
 ```
 
-Scripts de verificación incluidos:
+Verificaciones disponibles:
 
 ```bash
 npm run verify:rfc2
@@ -357,7 +214,12 @@ npm run verify:rfc7
 npm run verify:rfc8
 npm run verify:rfc9
 npm run verify:rfc10
+npm run verify:rfc11
 ```
+
+### Nota sobre scripts legacy
+
+El repo todavía puede conservar scripts como `npm run mock`, `npm run start:local` o `npm run stop:local`, pero NO forman parte del flujo soportado documentado en este README.
 
 ## Problemas comunes
 
@@ -368,32 +230,31 @@ Revisá esto en orden:
 1. `TELEGRAM_BOT_TOKEN` correcto.
 2. `ALLOWED_USER_ID` correcto.
 3. Estás escribiéndole desde el usuario permitido.
-4. El proceso está corriendo (`npm run dev` o `npm run start:local`).
-5. Si usás `http`, que `OPEN_CODE_URL` y `OPEN_CODE_TOKEN` coincidan con el backend/mock.
-6. Si usás `cli` o `pty`, que `opencode` esté en `PATH`.
-7. Si usás `pty`, que `tmux` esté instalado.
+4. El proceso está corriendo con `npm run dev`.
+5. `opencode` está en `PATH`.
+6. `tmux` está instalado y visible en `PATH`.
+7. Ya existe una sesión real de OpenCode para vincular.
 
-### `start:local` dice que ya hay una instancia corriendo
+### `/sesiones` no muestra nada
 
-Corré:
+Las causas más comunes son:
 
-```bash
-npm run stop:local
-```
+- no seleccionaste proyecto con `/project <ruta-local>`;
+- no hay sesiones reales de OpenCode para ese proyecto;
+- la sesión existe pero pertenece a otro path/proyecto;
+- la sesión no trae un path confiable y el bot la excluye por seguridad.
 
-### En WSL no encuentra el path del proyecto
+### El proyecto no coincide en WSL
 
-No uses rutas Windows tipo `C:\proyecto`.
-
-Usá rutas WSL/Linux, por ejemplo:
+Usá rutas WSL/Linux reales, por ejemplo:
 
 ```text
-/mnt/d/Proyectos/mi-proyecto
+/mnt/d/Proyectos/telegram-opencode
 ```
 
 ### Usuario no autorizado
 
-El bot hace **silent-drop**. O sea: no responde nada. Eso no es un bug; es una decisión de seguridad.
+El bot hace **silent-drop**. No responde nada. Eso NO es un bug; es una decisión de seguridad.
 
 ## Persistencia local
 
@@ -415,23 +276,23 @@ La prioridad es continuidad operativa.
 
 - El cliente de Telegram fuerza **IPv4** para evitar fallos tipo `EFATAL: AggregateError` en entornos donde IPv6 rompe.
 - La respuesta está hardcodeada en **español** en v1.
-- `start:local` crea `.local-runtime.json` para no duplicar instancias.
 - La documentación funcional y técnica vive en `docs/`.
 
 ## Estructura general
 
 - `src/` — código principal del bot
-- `mock/` — mock local de OpenCode
+- `mock/` — artefactos legacy de mock local
 - `docs/` — PRD, RFCs y runbooks
 - `data/` — estado local y artefactos generados
 
 ## Resumen
 
-Para que esto funcione de verdad necesitás CUATRO cosas bien configuradas:
+Para operar bien este proyecto necesitás CINCO cosas alineadas:
 
 1. un bot de Telegram real,
 2. un token válido,
 3. tu `from.id` correcto en allowlist,
-4. el modo de OpenCode bien elegido.
+4. `OPEN_CODE_ADAPTER=pty`,
+5. una sesión real de OpenCode disponible para el proyecto correcto.
 
-Si una de esas cuatro falla, el sistema no va a responder como esperás. Primero configuración correcta, después automatización.
+Primero fundamentos. Después automatización. Es así de simple.
