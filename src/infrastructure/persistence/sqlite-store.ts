@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   ActiveTaskRepository,
   BindingRepository,
+  DangerousActionConfirmationRepository,
   PendingPromptRepository,
   RECOVERY_REASON,
   RECOVERY_STATUS,
@@ -16,6 +17,8 @@ import { Config } from "../../config";
 import {
   ActiveTask,
   ChatBinding,
+  DangerousActionConfirmation,
+  DangerousActionConfirmationStatus,
   OperationalState,
   PendingPrompt,
   PendingPromptStatus,
@@ -117,6 +120,29 @@ interface PendingPromptRow {
   updated_at: string;
 }
 
+interface DangerousActionConfirmationRow {
+  confirmation_id: string;
+  actor_id: string;
+  chat_id: string;
+  chat_type: DangerousActionConfirmation["chatType"];
+  project_id: string;
+  session_id: string;
+  intent: string;
+  feature_flag: string;
+  target_environment: string;
+  status: DangerousActionConfirmationStatus;
+  expires_at: string;
+  created_at: string;
+  used_at: string | null;
+  invalidated_reason: string | null;
+  execution_result: "requested" | "failed" | null;
+  execution_reason: string | null;
+  launcher: "wt" | "powershell" | "manual-fallback" | null;
+  tmux_session_name: string | null;
+  manual_command: string | null;
+  executed_at: string | null;
+}
+
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS projects (
   project_id TEXT PRIMARY KEY,
@@ -196,6 +222,35 @@ CREATE TABLE IF NOT EXISTS pending_prompts (
 CREATE INDEX IF NOT EXISTS idx_pending_prompts_session_status ON pending_prompts(session_id, status);
 CREATE INDEX IF NOT EXISTS idx_pending_prompts_chat_status ON pending_prompts(chat_id, status);
 CREATE INDEX IF NOT EXISTS idx_pending_prompts_expires_status ON pending_prompts(expires_at, status);
+
+CREATE TABLE IF NOT EXISTS dangerous_action_confirmations (
+  confirmation_id TEXT PRIMARY KEY,
+  actor_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  chat_type TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  intent TEXT NOT NULL,
+  feature_flag TEXT NOT NULL,
+  target_environment TEXT NOT NULL,
+  status TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  used_at TEXT,
+  invalidated_reason TEXT
+  ,execution_result TEXT
+  ,execution_reason TEXT
+  ,launcher TEXT
+  ,tmux_session_name TEXT
+  ,manual_command TEXT
+  ,executed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dangerous_action_confirmations_status_expires
+  ON dangerous_action_confirmations(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_dangerous_action_confirmations_chat_status
+  ON dangerous_action_confirmations(chat_id, status);
+CREATE INDEX IF NOT EXISTS idx_dangerous_action_confirmations_session_status
+  ON dangerous_action_confirmations(session_id, status);
 `;
 
 export async function createSqlitePersistenceDriver(config: Config): Promise<PersistenceDriver> {
@@ -239,6 +294,7 @@ function initializeSqlite(db: SqliteDatabase): void {
   db.exec(SCHEMA_SQL);
   ensureSessionColumns(db);
   ensureStateColumns(db);
+  ensureDangerousActionColumns(db);
 }
 
 function ensureSessionColumns(db: SqliteDatabase): void {
@@ -367,8 +423,18 @@ function createSqliteUnit(db: SqliteDatabase): PersistenceUnit {
   const states = createStateRepository(db);
   const tasks = createActiveTaskRepository(db);
   const pendingPrompts = createPendingPromptRepository(db);
+  const dangerousActionConfirmations = createDangerousActionConfirmationRepository(db);
 
-  return { projects, sessions, bindings, states, tasks, pendingPrompts };
+  return { projects, sessions, bindings, states, tasks, pendingPrompts, dangerousActionConfirmations };
+}
+
+function ensureDangerousActionColumns(db: SqliteDatabase): void {
+  ensureColumn(db, "ALTER TABLE dangerous_action_confirmations ADD COLUMN execution_result TEXT;");
+  ensureColumn(db, "ALTER TABLE dangerous_action_confirmations ADD COLUMN execution_reason TEXT;");
+  ensureColumn(db, "ALTER TABLE dangerous_action_confirmations ADD COLUMN launcher TEXT;");
+  ensureColumn(db, "ALTER TABLE dangerous_action_confirmations ADD COLUMN tmux_session_name TEXT;");
+  ensureColumn(db, "ALTER TABLE dangerous_action_confirmations ADD COLUMN manual_command TEXT;");
+  ensureColumn(db, "ALTER TABLE dangerous_action_confirmations ADD COLUMN executed_at TEXT;");
 }
 
 function createProjectRepository(db: SqliteDatabase): ProjectRepository {
@@ -862,6 +928,232 @@ function mapPendingPromptRow(row: PendingPromptRow): PendingPrompt {
     submittedInput: row.submitted_input ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function createDangerousActionConfirmationRepository(
+  db: SqliteDatabase
+): DangerousActionConfirmationRepository {
+  return {
+    async compareAndSetStatus(input) {
+      const updateResult = db
+        .prepare(
+          `UPDATE dangerous_action_confirmations
+              SET status = :toStatus,
+                  used_at = COALESCE(:usedAt, used_at),
+                  invalidated_reason = COALESCE(:invalidatedReason, invalidated_reason)
+            WHERE confirmation_id = :confirmationId
+              AND status = :fromStatus`
+        )
+        .run({
+          confirmationId: input.confirmationId,
+          fromStatus: input.fromStatus,
+          toStatus: input.toStatus,
+          usedAt: input.usedAt ?? null,
+          invalidatedReason: input.invalidatedReason ?? null,
+        });
+
+      if (extractSqliteChanges(updateResult) === 0) {
+        return undefined;
+      }
+
+      const row = db.prepare<DangerousActionConfirmationRow>(
+        `SELECT confirmation_id, actor_id, chat_id, chat_type, project_id, session_id, intent,
+                feature_flag, target_environment, status, expires_at, created_at, used_at,
+                invalidated_reason, execution_result, execution_reason, launcher,
+                tmux_session_name, manual_command, executed_at
+           FROM dangerous_action_confirmations
+          WHERE confirmation_id = :confirmationId`
+      ).get({ confirmationId: input.confirmationId });
+
+      return row ? mapDangerousActionConfirmationRow(row) : undefined;
+    },
+    async findByConfirmationId(confirmationId) {
+      const row = db.prepare<DangerousActionConfirmationRow>(
+        `SELECT confirmation_id, actor_id, chat_id, chat_type, project_id, session_id, intent,
+                feature_flag, target_environment, status, expires_at, created_at, used_at,
+                invalidated_reason, execution_result, execution_reason, launcher,
+                tmux_session_name, manual_command, executed_at
+           FROM dangerous_action_confirmations
+          WHERE confirmation_id = :confirmationId`
+      ).get({ confirmationId });
+
+      return row ? mapDangerousActionConfirmationRow(row) : undefined;
+    },
+    async invalidateActiveByChat(input) {
+      const result = db
+        .prepare(
+          `UPDATE dangerous_action_confirmations
+              SET status = 'invalidated',
+                  invalidated_reason = :reason
+            WHERE chat_id = :chatId
+              AND status = 'active'`
+        )
+        .run({ chatId: input.chatId, reason: input.reason });
+
+      return extractSqliteChanges(result);
+    },
+    async invalidateActiveByProject(input) {
+      const result = db
+        .prepare(
+          `UPDATE dangerous_action_confirmations
+              SET status = 'invalidated',
+                  invalidated_reason = :reason
+            WHERE chat_id = :chatId
+              AND project_id = :projectId
+              AND status = 'active'`
+        )
+        .run({ chatId: input.chatId, projectId: input.projectId, reason: input.reason });
+
+      return extractSqliteChanges(result);
+    },
+    async invalidateActiveBySession(input) {
+      const result = db
+        .prepare(
+          `UPDATE dangerous_action_confirmations
+              SET status = 'invalidated',
+                  invalidated_reason = :reason
+            WHERE chat_id = :chatId
+              AND session_id = :sessionId
+              AND status = 'active'`
+        )
+        .run({ chatId: input.chatId, sessionId: input.sessionId, reason: input.reason });
+
+      return extractSqliteChanges(result);
+    },
+    async listAll() {
+      const rows = db.prepare<DangerousActionConfirmationRow>(
+        `SELECT confirmation_id, actor_id, chat_id, chat_type, project_id, session_id, intent,
+                feature_flag, target_environment, status, expires_at, created_at, used_at,
+                invalidated_reason, execution_result, execution_reason, launcher,
+                tmux_session_name, manual_command, executed_at
+           FROM dangerous_action_confirmations
+          ORDER BY created_at ASC`
+      ).all();
+
+      return rows.map(mapDangerousActionConfirmationRow);
+    },
+    async recordExecutionOutcome(input) {
+      const updated = db
+        .prepare(
+          `UPDATE dangerous_action_confirmations
+              SET execution_result = :executionResult,
+                  execution_reason = :executionReason,
+                  launcher = :launcher,
+                  tmux_session_name = :tmuxSessionName,
+                  manual_command = :manualCommand,
+                  executed_at = :executedAt
+            WHERE confirmation_id = :confirmationId`
+        )
+        .run({
+          confirmationId: input.confirmationId,
+          executionResult: input.executionResult,
+          executionReason: input.executionReason ?? null,
+          launcher: input.launcher,
+          tmuxSessionName: input.tmuxSessionName,
+          manualCommand: input.manualCommand,
+          executedAt: input.executedAt,
+        });
+
+      if (extractSqliteChanges(updated) === 0) {
+        return undefined;
+      }
+
+      const row = db.prepare<DangerousActionConfirmationRow>(
+        `SELECT confirmation_id, actor_id, chat_id, chat_type, project_id, session_id, intent,
+                feature_flag, target_environment, status, expires_at, created_at, used_at,
+                invalidated_reason, execution_result, execution_reason, launcher,
+                tmux_session_name, manual_command, executed_at
+           FROM dangerous_action_confirmations
+          WHERE confirmation_id = :confirmationId`
+      ).get({ confirmationId: input.confirmationId });
+
+      return row ? mapDangerousActionConfirmationRow(row) : undefined;
+    },
+    async upsert(confirmation) {
+      db.prepare(
+        `INSERT INTO dangerous_action_confirmations (
+           confirmation_id, actor_id, chat_id, chat_type, project_id, session_id, intent,
+           feature_flag, target_environment, status, expires_at, created_at, used_at,
+           invalidated_reason, execution_result, execution_reason, launcher,
+           tmux_session_name, manual_command, executed_at
+         )
+         VALUES (
+           :confirmationId, :actorId, :chatId, :chatType, :projectId, :sessionId, :intent,
+           :featureFlag, :targetEnvironment, :status, :expiresAt, :createdAt, :usedAt,
+           :invalidatedReason, :executionResult, :executionReason, :launcher,
+           :tmuxSessionName, :manualCommand, :executedAt
+         )
+         ON CONFLICT(confirmation_id) DO UPDATE SET
+           actor_id = excluded.actor_id,
+           chat_id = excluded.chat_id,
+           chat_type = excluded.chat_type,
+           project_id = excluded.project_id,
+           session_id = excluded.session_id,
+           intent = excluded.intent,
+           feature_flag = excluded.feature_flag,
+           target_environment = excluded.target_environment,
+           status = excluded.status,
+           expires_at = excluded.expires_at,
+           created_at = excluded.created_at,
+           used_at = excluded.used_at,
+           invalidated_reason = excluded.invalidated_reason,
+           execution_result = excluded.execution_result,
+           execution_reason = excluded.execution_reason,
+           launcher = excluded.launcher,
+           tmux_session_name = excluded.tmux_session_name,
+           manual_command = excluded.manual_command,
+           executed_at = excluded.executed_at`
+      ).run({
+        confirmationId: confirmation.confirmationId,
+        actorId: confirmation.actorId,
+        chatId: confirmation.chatId,
+        chatType: confirmation.chatType,
+        projectId: confirmation.projectId,
+        sessionId: confirmation.sessionId,
+        intent: confirmation.intent,
+        featureFlag: confirmation.featureFlag,
+        targetEnvironment: confirmation.targetEnvironment,
+        status: confirmation.status,
+        expiresAt: confirmation.expiresAt,
+        createdAt: confirmation.createdAt,
+        usedAt: confirmation.usedAt ?? null,
+        invalidatedReason: confirmation.invalidatedReason ?? null,
+        executionResult: confirmation.executionResult ?? null,
+        executionReason: confirmation.executionReason ?? null,
+        launcher: confirmation.launcher ?? null,
+        tmuxSessionName: confirmation.tmuxSessionName ?? null,
+        manualCommand: confirmation.manualCommand ?? null,
+        executedAt: confirmation.executedAt ?? null,
+      });
+    },
+  };
+}
+
+function mapDangerousActionConfirmationRow(
+  row: DangerousActionConfirmationRow
+): DangerousActionConfirmation {
+  return {
+    confirmationId: row.confirmation_id,
+    actorId: row.actor_id,
+    chatId: row.chat_id,
+    chatType: row.chat_type,
+    projectId: row.project_id,
+    sessionId: row.session_id,
+    intent: row.intent,
+    featureFlag: row.feature_flag,
+    targetEnvironment: row.target_environment,
+    status: row.status,
+    expiresAt: row.expires_at,
+    createdAt: row.created_at,
+    usedAt: row.used_at ?? undefined,
+    invalidatedReason: row.invalidated_reason ?? undefined,
+    executionResult: row.execution_result ?? undefined,
+    executionReason: row.execution_reason ?? undefined,
+    launcher: row.launcher ?? undefined,
+    tmuxSessionName: row.tmux_session_name ?? undefined,
+    manualCommand: row.manual_command ?? undefined,
+    executedAt: row.executed_at ?? undefined,
   };
 }
 

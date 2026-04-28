@@ -36,6 +36,10 @@ export interface Config {
   watchdogMaxRetryCount: number;
   humanPromptsEnabled: boolean;
   humanPromptLocalTtlMs: number;
+  localHostActionsEnabled?: boolean;
+  attachLocalEnabled?: boolean;
+  localHostConfirmationTtlMs?: number;
+  localTerminalLaunchTimeoutMs?: number;
 }
 
 export const STATE_DRIVERS = {
@@ -208,6 +212,8 @@ export function loadConfig(): Config {
   const watchdogStaleAfterMs = parseInteger("WATCHDOG_STALE_AFTER_MS", 60000);
   const watchdogMaxRetryCount = parseInteger("WATCHDOG_MAX_RETRY_COUNT", 3);
   const humanPromptLocalTtlMs = parseInteger("HUMAN_PROMPT_LOCAL_TTL_MS", 300000);
+  const localHostConfirmationTtlMs = parseInteger("LOCAL_HOST_CONFIRMATION_TTL_MS", 60000);
+  const localTerminalLaunchTimeoutMs = parseInteger("LOCAL_TERMINAL_LAUNCH_TIMEOUT_MS", 4000);
 
   validatePortRange(webhookPortStart, webhookPortEnd);
 
@@ -254,6 +260,10 @@ export function loadConfig(): Config {
     watchdogMaxRetryCount,
     humanPromptsEnabled: parseBoolean("HUMAN_PROMPTS_ENABLED", false),
     humanPromptLocalTtlMs,
+    localHostActionsEnabled: parseBoolean("ENABLE_LOCAL_HOST_ACTIONS", false),
+    attachLocalEnabled: parseBoolean("ENABLE_ATTACH_LOCAL", false),
+    localHostConfirmationTtlMs,
+    localTerminalLaunchTimeoutMs,
   };
 }
 

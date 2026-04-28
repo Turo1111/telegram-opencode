@@ -111,6 +111,57 @@ export interface PendingPrompt {
   updatedAt: string;
 }
 
+export const DANGEROUS_ACTION_CONFIRMATION_STATUS = {
+  ACTIVE: "active",
+  CONFIRMED: "confirmed",
+  EXPIRED: "expired",
+  INVALIDATED: "invalidated",
+  CANCELLED: "cancelled",
+} as const;
+
+export type DangerousActionConfirmationStatus =
+  (typeof DANGEROUS_ACTION_CONFIRMATION_STATUS)[keyof typeof DANGEROUS_ACTION_CONFIRMATION_STATUS];
+
+export const ATTACH_LOCAL_EXECUTION_RESULT = {
+  REQUESTED: "requested",
+  FAILED: "failed",
+} as const;
+
+export type AttachLocalExecutionResult =
+  (typeof ATTACH_LOCAL_EXECUTION_RESULT)[keyof typeof ATTACH_LOCAL_EXECUTION_RESULT];
+
+export const LOCAL_TERMINAL_LAUNCHER = {
+  WT: "wt",
+  POWERSHELL: "powershell",
+  MANUAL_FALLBACK: "manual-fallback",
+} as const;
+
+export type LocalTerminalLauncherKind =
+  (typeof LOCAL_TERMINAL_LAUNCHER)[keyof typeof LOCAL_TERMINAL_LAUNCHER];
+
+export interface DangerousActionConfirmation {
+  confirmationId: string;
+  actorId: string;
+  chatId: string;
+  chatType: "private" | "group" | "supergroup" | "channel";
+  projectId: string;
+  sessionId: string;
+  intent: string;
+  featureFlag: string;
+  targetEnvironment: string;
+  status: DangerousActionConfirmationStatus;
+  expiresAt: string;
+  createdAt: string;
+  usedAt?: string;
+  invalidatedReason?: string;
+  executionResult?: AttachLocalExecutionResult;
+  executionReason?: string;
+  launcher?: LocalTerminalLauncherKind;
+  tmuxSessionName?: string;
+  manualCommand?: string;
+  executedAt?: string;
+}
+
 export interface DomainSnapshot {
   binding: ChatBinding;
   state: OperationalState;

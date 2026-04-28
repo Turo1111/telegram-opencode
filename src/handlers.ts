@@ -114,6 +114,9 @@ function getSharedTelegramRouter(deps: HandlerDeps): TelegramRouterInstance {
     openCodeAdapterMode: deps.config.openCodeAdapter,
     openCodeControlTimeoutMs: deps.config.openCodeControlTimeoutMs,
     inspectProjectSessionsFn: deps.inspectProjectSessionsFn,
+    localHostActionsEnabled: deps.config.localHostActionsEnabled,
+    attachLocalEnabled: deps.config.attachLocalEnabled,
+    localHostConfirmationTtlMs: deps.config.localHostConfirmationTtlMs,
   });
 
   sharedRoutersByBot.set(deps.bot, router);

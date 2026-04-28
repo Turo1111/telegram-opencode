@@ -1,6 +1,11 @@
 import {
   ActiveTask,
+  ATTACH_LOCAL_EXECUTION_RESULT,
   ChatBinding,
+  DangerousActionConfirmation,
+  DangerousActionConfirmationStatus,
+  LOCAL_TERMINAL_LAUNCHER,
+  LocalTerminalLauncherKind,
   OperationalState,
   PendingPrompt,
   PendingPromptStatus,
@@ -30,6 +35,7 @@ export const ADAPTER_ERROR_CODES = {
   TIMEOUT: "TIMEOUT",
   UNAVAILABLE: "UNAVAILABLE",
   UNSUPPORTED: "UNSUPPORTED",
+  AMBIGUOUS_SESSION_CANDIDATE: "AMBIGUOUS_SESSION_CANDIDATE",
   UNKNOWN: "UNKNOWN",
 } as const;
 
@@ -108,6 +114,13 @@ export interface SessionState {
   status: RemoteSessionStatus;
   taskId?: string;
   updatedAt?: string;
+}
+
+export interface BootstrapSessionInput {
+  readonly projectId: string;
+  readonly rootPath: string;
+  readonly initialPrompt: string;
+  readonly timeoutMs: number;
 }
 
 export const SESSION_EVENT_KIND = {
@@ -289,6 +302,87 @@ export interface PendingPromptRepository {
   upsert(prompt: PendingPrompt): Promise<void>;
 }
 
+export const SENSITIVE_ACTION_AUDIT_RESULT = {
+  REQUESTED: "requested",
+  CONFIRMATION_ISSUED: "confirmation-issued",
+  CONFIRMED: "confirmed",
+  REJECTED: "rejected",
+  CANCELLED: "cancelled",
+  FAILED: "failed",
+  EXECUTED: "executed",
+} as const;
+
+export type SensitiveActionAuditResult =
+  (typeof SENSITIVE_ACTION_AUDIT_RESULT)[keyof typeof SENSITIVE_ACTION_AUDIT_RESULT];
+
+export interface SensitiveActionAuditEvent {
+  readonly actorId?: string;
+  readonly chatId: string;
+  readonly chatType?: string;
+  readonly action: string;
+  readonly projectId?: string;
+  readonly sessionId?: string;
+  readonly result: SensitiveActionAuditResult;
+  readonly reason?: string;
+  readonly timestamp: string;
+  readonly confirmationId?: string;
+  readonly featureFlag?: string;
+  readonly targetEnvironment?: string;
+}
+
+export interface DangerousActionConfirmationRepository {
+  compareAndSetStatus(input: {
+    readonly confirmationId: string;
+    readonly fromStatus: DangerousActionConfirmationStatus;
+    readonly toStatus: DangerousActionConfirmationStatus;
+    readonly usedAt?: string;
+    readonly invalidatedReason?: string;
+  }): Promise<DangerousActionConfirmation | undefined>;
+  findByConfirmationId(confirmationId: string): Promise<DangerousActionConfirmation | undefined>;
+  invalidateActiveByChat(input: {
+    readonly chatId: string;
+    readonly reason: string;
+  }): Promise<number>;
+  invalidateActiveByProject(input: {
+    readonly chatId: string;
+    readonly projectId: string;
+    readonly reason: string;
+  }): Promise<number>;
+  invalidateActiveBySession(input: {
+    readonly chatId: string;
+    readonly sessionId: string;
+    readonly reason: string;
+  }): Promise<number>;
+  recordExecutionOutcome(input: {
+    readonly confirmationId: string;
+    readonly executionResult: (typeof ATTACH_LOCAL_EXECUTION_RESULT)[keyof typeof ATTACH_LOCAL_EXECUTION_RESULT];
+    readonly executionReason?: string;
+    readonly launcher: (typeof LOCAL_TERMINAL_LAUNCHER)[keyof typeof LOCAL_TERMINAL_LAUNCHER];
+    readonly tmuxSessionName: string;
+    readonly manualCommand: string;
+    readonly executedAt: string;
+  }): Promise<DangerousActionConfirmation | undefined>;
+  listAll(): Promise<DangerousActionConfirmation[]>;
+  upsert(confirmation: DangerousActionConfirmation): Promise<void>;
+}
+
+export interface AttachLocalLaunchResult {
+  readonly launcher: LocalTerminalLauncherKind;
+  readonly result: (typeof ATTACH_LOCAL_EXECUTION_RESULT)[keyof typeof ATTACH_LOCAL_EXECUTION_RESULT];
+  readonly tmuxSessionName: string;
+  readonly manualCommand: string;
+  readonly reason?: string;
+}
+
+export interface LocalTerminalLauncher {
+  isEnvironmentReady(): Promise<{ readonly ok: boolean; readonly reason?: string }>;
+  launchAttach(input: {
+    readonly projectPath: string;
+    readonly sessionId: string;
+    readonly tmuxSessionName: string;
+  }): Promise<AttachLocalLaunchResult>;
+}
+
 export interface PersistenceUnit {
   projects: ProjectRepository;
   sessions: SessionRepository;
@@ -296,6 +390,7 @@ export interface PersistenceUnit {
   states: StateRepository;
   tasks: ActiveTaskRepository;
   pendingPrompts: PendingPromptRepository;
+  dangerousActionConfirmations?: DangerousActionConfirmationRepository;
 }
 
 export interface PersistenceDriver {
@@ -304,6 +399,7 @@ export interface PersistenceDriver {
 
 export interface OpenCodeSessionAdapter {
   resolveProject(input: { projectId: string; rootPath: string }): Promise<Result<{ canonicalPath: string }>>;
+  bootstrapSession?(input: BootstrapSessionInput): Promise<Result<SessionState>>;
   createSession(input: {
     projectId: string;
     rootPath: string;

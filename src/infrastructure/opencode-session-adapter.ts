@@ -1,7 +1,9 @@
 import axios from "axios";
+import { randomUUID } from "node:crypto";
 import {
   ADAPTER_ERROR_CODES,
   AdapterError,
+  BootstrapSessionInput,
   CancelOrInterruptResult,
   ObserveSessionResult,
   OpenCodeSessionAdapter,
@@ -30,10 +32,17 @@ import {
 } from "./opencode-cli";
 import { OPEN_CODE_ADAPTER_MODE } from "./opencode-adapter-mode";
 import {
+  bootstrapResolutionToAdapterError,
+  BOOTSTRAP_RESOLUTION_KIND,
+  pollBootstrapSessionCandidate,
+} from "./opencode-session-bootstrap";
+import {
   ensureHostSession,
   interrupt,
+  killSessionByName,
   OpenCodeTmuxHostError,
   sendInput,
+  startTemporaryBootstrapSession,
 } from "./opencode-tmux-host";
 
 interface ResolveProjectResponse {
@@ -115,6 +124,17 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     } catch (error) {
       return err(mapAdapterResultError(mapOpenCodeError(error, "createSession")));
     }
+  }
+
+  async bootstrapSession(input: BootstrapSessionInput): Promise<Result<SessionState>> {
+    return err(
+      mapAdapterResultError(
+        unsupportedError(
+          "bootstrapSession",
+          "/new no está disponible en este backend. Usá /sesiones o /session <id>."
+        )
+      )
+    );
   }
 
   async attachSession(input: {
@@ -409,6 +429,17 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     );
   }
 
+  async bootstrapSession(input: BootstrapSessionInput): Promise<Result<SessionState>> {
+    return err(
+      mapAdapterResultError(
+        unsupportedError(
+          "bootstrapSession",
+          "/new no está disponible en modo CLI. Creá/continuá la sesión desde OpenCode y vinculala con /sesiones o /session <id>."
+        )
+      )
+    );
+  }
+
   async attachSession(input: {
     projectId: string;
     sessionId: string;
@@ -631,10 +662,14 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     },
     private readonly tmuxHostOps: {
       readonly ensureHostSession: typeof ensureHostSession;
+      readonly startTemporaryBootstrapSession?: typeof startTemporaryBootstrapSession;
+      readonly killSessionByName?: typeof killSessionByName;
       readonly sendInput: typeof sendInput;
       readonly interrupt: typeof interrupt;
     } = {
       ensureHostSession,
+      startTemporaryBootstrapSession,
+      killSessionByName,
       sendInput,
       interrupt,
     }
@@ -667,6 +702,60 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         )
       )
     );
+  }
+
+  async bootstrapSession(input: BootstrapSessionInput): Promise<Result<SessionState>> {
+    let temporarySessionName: string | undefined;
+
+    try {
+      const canonicalProjectPath = await this.cliOps.resolveCanonicalProjectPath(input.rootPath);
+      this.projectDirById.set(input.projectId, canonicalProjectPath);
+
+      const before = await this.cliOps.listSessions(input.timeoutMs);
+      temporarySessionName = await (this.tmuxHostOps.startTemporaryBootstrapSession ?? startTemporaryBootstrapSession)({
+        token: randomUUID().replace(/-/gu, ""),
+        dir: canonicalProjectPath,
+        initialPrompt: input.initialPrompt,
+        timeoutMs: input.timeoutMs,
+      });
+
+      const resolution = await pollBootstrapSessionCandidate({
+        before,
+        projectPath: canonicalProjectPath,
+        timeoutMs: input.timeoutMs,
+        listSessionsFn: this.cliOps.listSessions,
+        resolveCanonicalProjectPathFn: this.cliOps.resolveCanonicalProjectPath,
+      });
+
+      await this.killTemporaryBootstrapSession(temporarySessionName, input.timeoutMs);
+      temporarySessionName = undefined;
+
+      if (resolution.kind !== BOOTSTRAP_RESOLUTION_KIND.FOUND) {
+        return err(mapAdapterResultError(bootstrapResolutionToAdapterError({
+          resolution,
+          operation: "bootstrapSession",
+        })));
+      }
+
+      await this.tmuxHostOps.ensureHostSession({
+        opencodeSessionId: resolution.candidate.sessionId,
+        dir: canonicalProjectPath,
+        timeoutMs: input.timeoutMs,
+      });
+
+      return ok({
+        sessionId: resolution.candidate.sessionId,
+        projectId: input.projectId,
+        status: "idle",
+        updatedAt: resolution.candidate.updatedAt,
+      });
+    } catch (error) {
+      if (temporarySessionName) {
+        await this.killTemporaryBootstrapSession(temporarySessionName, input.timeoutMs);
+      }
+
+      return err(mapAdapterResultError(mapPtyError(error, "bootstrapSession")));
+    }
   }
 
   async attachSession(input: {
@@ -889,6 +978,18 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       dir,
       timeoutMs: this.config.openCodeControlTimeoutMs,
     });
+  }
+
+  private async killTemporaryBootstrapSession(sessionName: string, timeoutMs: number): Promise<void> {
+    try {
+      await (this.tmuxHostOps.killSessionByName ?? killSessionByName)({ sessionName, timeoutMs });
+    } catch (error) {
+      logger.error("Best-effort cleanup of temporary tmux session failed", {
+        event: "pty-bootstrap-cleanup",
+        tmuxSessionName: sessionName,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async resolveAndValidateSessionPath(

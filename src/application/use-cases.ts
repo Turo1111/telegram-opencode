@@ -1,5 +1,8 @@
 import {
   BootRecoveryNotice,
+  AttachLocalLaunchResult,
+  LocalTerminalLauncher,
+  SENSITIVE_ACTION_AUDIT_RESULT,
   OpenCodeSessionAdapter,
   TelegramPromptCallback,
   PersistenceDriver,
@@ -12,9 +15,22 @@ import {
 import { mapRemoteStatusToOperationalMode } from "./remote-mappers";
 import { BootRecoveryService, completeTaskIfExists, resolveStableSessionMode } from "./boot-recovery-service";
 import {
+  assertLocalHostActionAllowed,
+  LOCAL_HOST_ACTION_GUARD_REASON,
+  LOCAL_HOST_ACTION_KIND,
+  resolveLocalHostFeature,
+  TELEGRAM_CHAT_TYPES,
+  type LocalHostActionKind,
+} from "./local-host-hardening";
+import {
   ACTIVE_TASK_STATUS,
+  ATTACH_LOCAL_EXECUTION_RESULT,
   ActiveTask,
   ChatBinding,
+  DANGEROUS_ACTION_CONFIRMATION_STATUS,
+  LOCAL_TERMINAL_LAUNCHER,
+  DangerousActionConfirmation,
+  DangerousActionConfirmationStatus,
   OPERATIONAL_MODES,
   PENDING_PROMPT_STATUS,
   OperationalState,
@@ -43,6 +59,11 @@ export interface CreateSessionInput {
   chatId: string;
 }
 
+export interface BootstrapSessionCandidateInput {
+  readonly chatId: string;
+  readonly initialPrompt: string;
+}
+
 export interface SendTextInput {
   chatId: string;
   text: string;
@@ -61,6 +82,11 @@ export interface SelectProjectOutput {
 export interface SessionOutput {
   projectId: string;
   sessionId: string;
+}
+
+export interface BootstrapSessionCandidateOutput {
+  readonly projectId: string;
+  readonly sessionId: string;
 }
 
 export interface SendTextOutput {
@@ -149,11 +175,62 @@ export interface ApplicationUseCases {
   selectProject(input: SelectProjectInput): Promise<Result<SelectProjectOutput>>;
   attachSession(input: AttachSessionInput): Promise<Result<SessionOutput>>;
   createSession(input: CreateSessionInput): Promise<Result<SessionOutput>>;
+  bootstrapSessionCandidate?(input: BootstrapSessionCandidateInput): Promise<Result<BootstrapSessionCandidateOutput>>;
   sendText(input: SendTextInput): Promise<Result<SendTextOutput>>;
   runSessionCommand(input: RunSessionCommandInput): Promise<Result<RunSessionCommandOutput>>;
   submitPendingPrompt(input: SubmitPendingPromptInput): Promise<Result<SubmitPendingPromptOutput>>;
   cancelSession(input: CancelSessionInput): Promise<Result<CancelSessionOutput>>;
   getStatus(chatId: string): Promise<Result<StatusOutput>>;
+}
+
+export interface ConfirmDangerousActionInput {
+  readonly actorId: string;
+  readonly chatId: string;
+  readonly chatType: string;
+  readonly confirmationId: string;
+}
+
+export const CONFIRM_DANGEROUS_ACTION_RESULT_STATUS = {
+  CONFIRMED: "confirmed",
+  REJECTED: "rejected",
+  IDEMPOTENT: "idempotent",
+} as const;
+
+export type ConfirmDangerousActionResultStatus =
+  (typeof CONFIRM_DANGEROUS_ACTION_RESULT_STATUS)[keyof typeof CONFIRM_DANGEROUS_ACTION_RESULT_STATUS];
+
+export interface ConfirmDangerousActionOutput {
+  readonly confirmationId: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly intent: string;
+  readonly status: ConfirmDangerousActionResultStatus;
+  readonly confirmationStatus: DangerousActionConfirmationStatus;
+  readonly message: string;
+  readonly reason?: string;
+  readonly attachLocal?: AttachLocalLaunchResult;
+}
+
+export interface DangerousActionUseCases {
+  confirmDangerousAction(input: ConfirmDangerousActionInput): Promise<Result<ConfirmDangerousActionOutput>>;
+}
+
+interface LocalHostEnvironmentCheckResult {
+  readonly ok: boolean;
+  readonly reason?: string;
+}
+
+interface LocalHostHardeningOptions {
+  readonly allowedActorIds?: readonly string[];
+  readonly localHostActionsEnabled?: boolean;
+  readonly attachLocalEnabled?: boolean;
+  readonly localHostConfirmationTtlMs?: number;
+  readonly isLocalHostEnvironmentReady?: (input: {
+    readonly intent: LocalHostActionKind;
+    readonly targetEnvironment: string;
+    readonly projectId: string;
+    readonly sessionId: string;
+  }) => Promise<LocalHostEnvironmentCheckResult>;
 }
 
 interface CreateApplicationUseCasesDeps {
@@ -165,6 +242,12 @@ interface CreateApplicationUseCasesDeps {
     readonly message: string;
     readonly source: "send-text" | "run-command";
   }) => void;
+  localHostOptions?: LocalHostHardeningOptions;
+  localTerminalLauncher?: LocalTerminalLauncher;
+  hasTmuxSessionBySessionId?: (input: {
+    readonly opencodeSessionId: string;
+    readonly timeoutMs: number;
+  }) => Promise<{ readonly exists: boolean; readonly tmuxSessionName: string }>;
 }
 
 export interface BootRecoverResult {
@@ -189,7 +272,13 @@ interface ChatRuntimeContext {
   activeTask?: ActiveTask;
 }
 
-export function createApplicationUseCases(deps: CreateApplicationUseCasesDeps): ApplicationUseCases {
+export function createApplicationUseCases(
+  deps: CreateApplicationUseCasesDeps
+): ApplicationUseCases & DangerousActionUseCases {
+  const localHostAllowedActors = deps.localHostOptions?.allowedActorIds
+    ? new Set(deps.localHostOptions.allowedActorIds)
+    : undefined;
+
   return {
     async selectProject(input) {
       const selector = input.selector.trim();
@@ -252,6 +341,14 @@ export function createApplicationUseCases(deps: CreateApplicationUseCasesDeps): 
       }
 
       const output = await deps.persistence.runInTransaction(async (unit) => {
+        if (currentContext.binding.activeProjectId) {
+          await invalidateDangerousConfirmationsForProject(unit, input.chatId, currentContext.binding.activeProjectId);
+        }
+
+        if (currentContext.binding.activeSessionId) {
+          await invalidateDangerousConfirmationsForSession(unit, input.chatId, currentContext.binding.activeSessionId);
+        }
+
         const nextBinding = applyProjectSelection(candidate.binding, candidate.project.projectId, nowIso);
         const nextState: OperationalState = {
           chatId: input.chatId,
@@ -308,6 +405,10 @@ export function createApplicationUseCases(deps: CreateApplicationUseCasesDeps): 
       }
 
       const persisted = await deps.persistence.runInTransaction(async (unit) => {
+        if (context.binding.activeSessionId) {
+          await invalidateDangerousConfirmationsForSession(unit, input.chatId, context.binding.activeSessionId);
+        }
+
         const existingBinding = await ensureBinding(unit, input.chatId, nowIso);
         const existingProject = await unit.projects.findById(context.binding.activeProjectId!);
 
@@ -381,6 +482,10 @@ export function createApplicationUseCases(deps: CreateApplicationUseCasesDeps): 
       }
 
       const persisted = await deps.persistence.runInTransaction(async (unit) => {
+        if (context.binding.activeSessionId) {
+          await invalidateDangerousConfirmationsForSession(unit, input.chatId, context.binding.activeSessionId);
+        }
+
         const existingBinding = await ensureBinding(unit, input.chatId, nowIso);
         const session: Session = {
           sessionId: created.value.sessionId,
@@ -413,6 +518,83 @@ export function createApplicationUseCases(deps: CreateApplicationUseCasesDeps): 
           projectId: created.value.projectId,
           sessionId: created.value.sessionId,
         } satisfies SessionOutput;
+      });
+
+      return okResult(persisted);
+    },
+
+    async bootstrapSessionCandidate(input) {
+      const nowIso = new Date().toISOString();
+      const context = await deps.persistence.runInTransaction((unit) => loadChatRuntimeContext(unit, input.chatId, nowIso));
+
+      if (!context.binding.activeProjectId) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Primero elegí un proyecto con /project <alias|ruta> antes de crear una sesión.");
+      }
+
+      try {
+        assertNoActiveTaskConflict(context.state, context.activeTask);
+      } catch (error) {
+        return errResultFromUnknown(error);
+      }
+
+      if (!context.project) {
+        return errResult(ERROR_CODES.NOT_FOUND, "No encuentro el proyecto activo. Volvé a seleccionarlo con /project");
+      }
+
+      if (!deps.adapter.bootstrapSession) {
+        return errResult(ERROR_CODES.UNSUPPORTED, "/new no está disponible en este backend. Usá /sesiones o /session <id>.");
+      }
+
+      const initialPrompt = input.initialPrompt.trim();
+      if (!initialPrompt) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Usá /new <mensaje inicial>");
+      }
+
+      const bootstrapped = await deps.adapter.bootstrapSession({
+        projectId: context.project.projectId,
+        rootPath: context.project.rootPath,
+        initialPrompt,
+        timeoutMs: 30_000,
+      });
+
+      if (!bootstrapped.ok) {
+        return bootstrapped;
+      }
+
+      const persisted = await deps.persistence.runInTransaction(async (unit) => {
+        if (context.binding.activeSessionId) {
+          await invalidateDangerousConfirmationsForSession(unit, input.chatId, context.binding.activeSessionId);
+        }
+
+        const existingBinding = await ensureBinding(unit, input.chatId, nowIso);
+        const session: Session = {
+          sessionId: bootstrapped.value.sessionId,
+          projectId: bootstrapped.value.projectId,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+        const nextBinding: ChatBinding = {
+          ...existingBinding,
+          activeProjectId: bootstrapped.value.projectId,
+          activeSessionId: bootstrapped.value.sessionId,
+          updatedAt: nowIso,
+        };
+        const nextState = mapRemoteStatusToOperationalState({
+          chatId: input.chatId,
+          modeHint: bootstrapped.value.status,
+          taskId: bootstrapped.value.taskId,
+          nowIso,
+        });
+
+        await unit.sessions.upsert(session);
+        await unit.bindings.upsert(nextBinding);
+        await unit.states.upsert(nextState);
+        await unit.projects.markLastUsed(bootstrapped.value.projectId, nowIso);
+
+        return {
+          projectId: bootstrapped.value.projectId,
+          sessionId: bootstrapped.value.sessionId,
+        } satisfies BootstrapSessionCandidateOutput;
       });
 
       return okResult(persisted);
@@ -938,6 +1120,363 @@ export function createApplicationUseCases(deps: CreateApplicationUseCasesDeps): 
       const fresh = await deps.persistence.runInTransaction((unit) => loadChatRuntimeContext(unit, chatId, nowIso));
       return okResult(toStatusOutput(fresh));
     },
+
+    async confirmDangerousAction(input) {
+      const nowIso = new Date().toISOString();
+      const featureResolution = resolveLocalHostFeature({
+        action: LOCAL_HOST_ACTION_KIND.ATTACH_LOCAL,
+        localHostActionsEnabled: deps.localHostOptions?.localHostActionsEnabled ?? false,
+        attachLocalEnabled: deps.localHostOptions?.attachLocalEnabled ?? false,
+      });
+
+      const preflight = await deps.persistence.runInTransaction(async (unit) => {
+        const repository = unit.dangerousActionConfirmations;
+        if (!repository) {
+          return {
+            kind: "error",
+            result: errResult<ConfirmDangerousActionOutput>(
+              ERROR_CODES.UNAVAILABLE,
+              "La confirmación sensible no está disponible en esta instancia."
+            ),
+          } as const;
+        }
+
+        const confirmation = await repository.findByConfirmationId(input.confirmationId);
+        if (!confirmation) {
+          return {
+            kind: "error",
+            result: errResult<ConfirmDangerousActionOutput>(
+              ERROR_CODES.NOT_FOUND,
+              "La confirmación ya no existe o venció."
+            ),
+          } as const;
+        }
+
+        if (confirmation.status !== DANGEROUS_ACTION_CONFIRMATION_STATUS.ACTIVE) {
+          return {
+            kind: "idempotent",
+            output: toDangerousActionOutput({
+              confirmation,
+              status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.IDEMPOTENT,
+              confirmationStatus: confirmation.status,
+              message: "Esta confirmación ya no está vigente.",
+              reason: confirmation.invalidatedReason ?? "already-terminal",
+            }),
+          } as const;
+        }
+
+        if (new Date(confirmation.expiresAt).getTime() <= Date.now()) {
+          const expired = await repository.compareAndSetStatus({
+            confirmationId: confirmation.confirmationId,
+            fromStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.ACTIVE,
+            toStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.EXPIRED,
+            invalidatedReason: "expired",
+          });
+
+          const finalConfirmation = expired ?? confirmation;
+          logger.audit(buildSensitiveAuditEvent(finalConfirmation, {
+            result: SENSITIVE_ACTION_AUDIT_RESULT.REJECTED,
+            reason: "expired",
+            timestamp: nowIso,
+          }));
+
+          return {
+            kind: "rejected",
+            output: toDangerousActionOutput({
+              confirmation: finalConfirmation,
+              status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.REJECTED,
+              confirmationStatus: expired?.status ?? DANGEROUS_ACTION_CONFIRMATION_STATUS.EXPIRED,
+              message: "La confirmación sensible expiró.",
+              reason: "expired",
+            }),
+          } as const;
+        }
+
+        const binding = await ensureBinding(unit, input.chatId, nowIso);
+        const session = binding.activeSessionId ? await unit.sessions.findById(binding.activeSessionId) : undefined;
+        const guard = assertLocalHostActionAllowed({
+          actorId: input.actorId,
+          allowedActorIds: localHostAllowedActors,
+          chatType: input.chatType,
+          featureEnabled: featureResolution.featureEnabled,
+          projectId: binding.activeProjectId,
+          sessionId: binding.activeSessionId,
+          sessionProjectId: session?.projectId,
+        });
+
+        if (!guard.ok) {
+          const invalidated = await repository.compareAndSetStatus({
+            confirmationId: confirmation.confirmationId,
+            fromStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.ACTIVE,
+            toStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.INVALIDATED,
+            invalidatedReason: guard.reason,
+          });
+          const finalConfirmation = invalidated ?? confirmation;
+
+          logger.audit(buildSensitiveAuditEvent(finalConfirmation, {
+            result: SENSITIVE_ACTION_AUDIT_RESULT.REJECTED,
+            reason: guard.reason,
+            timestamp: nowIso,
+          }));
+
+          return {
+            kind: "rejected",
+            output: toDangerousActionOutput({
+              confirmation: finalConfirmation,
+              status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.REJECTED,
+              confirmationStatus: invalidated?.status ?? DANGEROUS_ACTION_CONFIRMATION_STATUS.INVALIDATED,
+              message: "El contexto cambió o dejó de ser seguro para esta acción.",
+              reason: guard.reason,
+            }),
+          } as const;
+        }
+
+        if (
+          confirmation.actorId !== input.actorId ||
+          confirmation.chatId !== input.chatId ||
+          confirmation.chatType !== input.chatType ||
+          confirmation.projectId !== binding.activeProjectId ||
+          confirmation.sessionId !== binding.activeSessionId ||
+          confirmation.intent !== LOCAL_HOST_ACTION_KIND.ATTACH_LOCAL
+        ) {
+          const invalidated = await repository.compareAndSetStatus({
+            confirmationId: confirmation.confirmationId,
+            fromStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.ACTIVE,
+            toStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.INVALIDATED,
+            invalidatedReason: "context-mismatch",
+          });
+          const finalConfirmation = invalidated ?? confirmation;
+
+          logger.audit(buildSensitiveAuditEvent(finalConfirmation, {
+            result: SENSITIVE_ACTION_AUDIT_RESULT.REJECTED,
+            reason: "context-mismatch",
+            timestamp: nowIso,
+          }));
+
+          return {
+            kind: "rejected",
+            output: toDangerousActionOutput({
+              confirmation: finalConfirmation,
+              status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.REJECTED,
+              confirmationStatus: invalidated?.status ?? DANGEROUS_ACTION_CONFIRMATION_STATUS.INVALIDATED,
+              message: "La confirmación dejó de coincidir con el contexto activo.",
+              reason: "context-mismatch",
+            }),
+          } as const;
+        }
+
+        const environmentCheck = deps.localHostOptions?.isLocalHostEnvironmentReady
+          ? await deps.localHostOptions.isLocalHostEnvironmentReady({
+              intent: LOCAL_HOST_ACTION_KIND.ATTACH_LOCAL,
+              targetEnvironment: confirmation.targetEnvironment,
+              projectId: confirmation.projectId,
+              sessionId: confirmation.sessionId,
+            })
+          : { ok: true };
+
+        const environmentGuard = assertLocalHostActionAllowed({
+          actorId: input.actorId,
+          allowedActorIds: localHostAllowedActors,
+          chatType: input.chatType,
+          featureEnabled: featureResolution.featureEnabled,
+          projectId: confirmation.projectId,
+          sessionId: confirmation.sessionId,
+          sessionProjectId: session?.projectId,
+          environmentReady: environmentCheck.ok,
+          environmentReason: environmentCheck.reason,
+        });
+
+        if (!environmentGuard.ok) {
+          const invalidated = await repository.compareAndSetStatus({
+            confirmationId: confirmation.confirmationId,
+            fromStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.ACTIVE,
+            toStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.INVALIDATED,
+            invalidatedReason: environmentGuard.reason,
+          });
+          const finalConfirmation = invalidated ?? confirmation;
+
+          logger.audit(buildSensitiveAuditEvent(finalConfirmation, {
+            result: SENSITIVE_ACTION_AUDIT_RESULT.REJECTED,
+            reason: environmentGuard.reason,
+            timestamp: nowIso,
+          }));
+
+          return {
+            kind: "rejected",
+            output: toDangerousActionOutput({
+              confirmation: finalConfirmation,
+              status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.REJECTED,
+              confirmationStatus: invalidated?.status ?? DANGEROUS_ACTION_CONFIRMATION_STATUS.INVALIDATED,
+              message: "El entorno local no está listo para esta acción sensible.",
+              reason: environmentGuard.reason,
+            }),
+          } as const;
+        }
+
+        const confirmed = await repository.compareAndSetStatus({
+          confirmationId: confirmation.confirmationId,
+          fromStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.ACTIVE,
+          toStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.CONFIRMED,
+          usedAt: nowIso,
+        });
+
+        if (!confirmed) {
+          const latest = await repository.findByConfirmationId(confirmation.confirmationId);
+          if (!latest) {
+            return {
+              kind: "error",
+              result: errResult<ConfirmDangerousActionOutput>(
+                ERROR_CODES.NOT_FOUND,
+                "La confirmación ya no existe o expiró."
+              ),
+            } as const;
+          }
+
+          return {
+            kind: "idempotent",
+            output: toDangerousActionOutput({
+              confirmation: latest,
+              status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.IDEMPOTENT,
+              confirmationStatus: latest.status,
+              message: "Esta confirmación ya fue procesada.",
+              reason: latest.invalidatedReason ?? "status-changed-during-confirm",
+            }),
+          } as const;
+        }
+
+        logger.audit(buildSensitiveAuditEvent(confirmed, {
+          result: SENSITIVE_ACTION_AUDIT_RESULT.CONFIRMED,
+          timestamp: nowIso,
+        }));
+
+        const project = await unit.projects.findById(confirmed.projectId);
+        const matchedSession = await unit.sessions.findById(confirmed.sessionId);
+        if (!project || !matchedSession || matchedSession.projectId !== confirmed.projectId) {
+          const rejectedReason = "context-mismatch";
+          logger.audit(buildSensitiveAuditEvent(confirmed, {
+            result: SENSITIVE_ACTION_AUDIT_RESULT.REJECTED,
+            reason: rejectedReason,
+            timestamp: nowIso,
+          }));
+          return {
+            kind: "rejected",
+            output: toDangerousActionOutput({
+              confirmation: confirmed,
+              status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.REJECTED,
+              confirmationStatus: confirmed.status,
+              message: "No se pudo validar el contexto de proyecto/sesión.",
+              reason: rejectedReason,
+            }),
+          } as const;
+        }
+
+        if (!deps.localTerminalLauncher || !deps.hasTmuxSessionBySessionId) {
+          logger.audit(buildSensitiveAuditEvent(confirmed, {
+            result: SENSITIVE_ACTION_AUDIT_RESULT.EXECUTED,
+            reason: "platform-placeholder-no-local-exec",
+            timestamp: nowIso,
+          }));
+
+          return {
+            kind: "confirmed",
+            output: toDangerousActionOutput({
+              confirmation: confirmed,
+              status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.CONFIRMED,
+              confirmationStatus: confirmed.status,
+              message:
+                "Confirmación validada. La acción local real todavía no está implementada; este RFC deja listo el perímetro de seguridad.",
+            }),
+          } as const;
+        }
+
+        const tmuxCheck = await deps.hasTmuxSessionBySessionId({
+          opencodeSessionId: confirmed.sessionId,
+          timeoutMs: 3_000,
+        });
+
+        if (!tmuxCheck.exists) {
+          const manualCommand = `wsl.exe bash -lc 'tmux attach -t ${tmuxCheck.tmuxSessionName}'`;
+          const outcome = await repository.recordExecutionOutcome({
+            confirmationId: confirmed.confirmationId,
+            executionResult: ATTACH_LOCAL_EXECUTION_RESULT.FAILED,
+            executionReason: "tmux-session-missing",
+            launcher: LOCAL_TERMINAL_LAUNCHER.MANUAL_FALLBACK,
+            tmuxSessionName: tmuxCheck.tmuxSessionName,
+            manualCommand,
+            executedAt: nowIso,
+          });
+
+          logger.audit(buildSensitiveAuditEvent(outcome ?? confirmed, {
+            result: SENSITIVE_ACTION_AUDIT_RESULT.REJECTED,
+            reason: "tmux-session-missing",
+            timestamp: nowIso,
+          }));
+
+          return {
+            kind: "rejected",
+            output: toDangerousActionOutput({
+              confirmation: outcome ?? confirmed,
+              status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.REJECTED,
+              confirmationStatus: confirmed.status,
+              message: "No encontré la sesión tmux activa. Revalidá con /sesiones o /session.",
+              reason: "tmux-session-missing",
+              attachLocal: {
+                launcher: LOCAL_TERMINAL_LAUNCHER.MANUAL_FALLBACK,
+                result: ATTACH_LOCAL_EXECUTION_RESULT.FAILED,
+                tmuxSessionName: tmuxCheck.tmuxSessionName,
+                manualCommand,
+                reason: "tmux-session-missing",
+              },
+            }),
+          } as const;
+        }
+
+        const launchResult = await deps.localTerminalLauncher.launchAttach({
+          projectPath: project.rootPath,
+          sessionId: confirmed.sessionId,
+          tmuxSessionName: tmuxCheck.tmuxSessionName,
+        });
+
+        const persisted = await repository.recordExecutionOutcome({
+          confirmationId: confirmed.confirmationId,
+          executionResult: launchResult.result,
+          executionReason: launchResult.reason,
+          launcher: launchResult.launcher,
+          tmuxSessionName: launchResult.tmuxSessionName,
+          manualCommand: launchResult.manualCommand,
+          executedAt: nowIso,
+        });
+
+        logger.audit(buildSensitiveAuditEvent(persisted ?? confirmed, {
+          result:
+            launchResult.result === ATTACH_LOCAL_EXECUTION_RESULT.REQUESTED
+              ? SENSITIVE_ACTION_AUDIT_RESULT.REQUESTED
+              : SENSITIVE_ACTION_AUDIT_RESULT.FAILED,
+          reason: launchResult.reason,
+          timestamp: nowIso,
+        }));
+
+        return {
+          kind: "confirmed",
+          output: toDangerousActionOutput({
+            confirmation: persisted ?? confirmed,
+            status: CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.CONFIRMED,
+            confirmationStatus: confirmed.status,
+            message:
+              launchResult.result === ATTACH_LOCAL_EXECUTION_RESULT.REQUESTED
+                ? "Terminal local solicitada para adjuntar tmux."
+                : "No pude abrir terminal automáticamente. Usá fallback manual.",
+            attachLocal: launchResult,
+          }),
+        } as const;
+      });
+
+      if (preflight.kind === "error") {
+        return preflight.result;
+      }
+
+      return okResult(preflight.output);
+    },
   };
 }
 
@@ -1198,6 +1737,75 @@ function toIdempotentPromptOutput(prompt: PendingPrompt, reason: string): Submit
     promptStatus: prompt.status,
     reason,
   };
+}
+
+function toDangerousActionOutput(input: {
+  readonly confirmation: DangerousActionConfirmation;
+  readonly status: ConfirmDangerousActionResultStatus;
+  readonly confirmationStatus: DangerousActionConfirmationStatus;
+  readonly message: string;
+  readonly reason?: string;
+  readonly attachLocal?: AttachLocalLaunchResult;
+}): ConfirmDangerousActionOutput {
+  return {
+    confirmationId: input.confirmation.confirmationId,
+    projectId: input.confirmation.projectId,
+    sessionId: input.confirmation.sessionId,
+    intent: input.confirmation.intent,
+    status: input.status,
+    confirmationStatus: input.confirmationStatus,
+    message: input.message,
+    reason: input.reason,
+    attachLocal: input.attachLocal,
+  };
+}
+
+function buildSensitiveAuditEvent(
+  confirmation: DangerousActionConfirmation,
+  input: {
+    readonly result: (typeof SENSITIVE_ACTION_AUDIT_RESULT)[keyof typeof SENSITIVE_ACTION_AUDIT_RESULT];
+    readonly timestamp: string;
+    readonly reason?: string;
+  }
+) {
+  return {
+    actorId: confirmation.actorId,
+    chatId: confirmation.chatId,
+    chatType: confirmation.chatType,
+    action: confirmation.intent,
+    projectId: confirmation.projectId,
+    sessionId: confirmation.sessionId,
+    result: input.result,
+    reason: input.reason,
+    timestamp: input.timestamp,
+    confirmationId: confirmation.confirmationId,
+    featureFlag: confirmation.featureFlag,
+    targetEnvironment: confirmation.targetEnvironment,
+  };
+}
+
+async function invalidateDangerousConfirmationsForProject(
+  unit: PersistenceUnit,
+  chatId: string,
+  projectId: string
+): Promise<void> {
+  await unit.dangerousActionConfirmations?.invalidateActiveByProject({
+    chatId,
+    projectId,
+    reason: "project-changed",
+  });
+}
+
+async function invalidateDangerousConfirmationsForSession(
+  unit: PersistenceUnit,
+  chatId: string,
+  sessionId: string
+): Promise<void> {
+  await unit.dangerousActionConfirmations?.invalidateActiveBySession({
+    chatId,
+    sessionId,
+    reason: "session-changed",
+  });
 }
 
 function okResult<T>(value: T): Result<T> {

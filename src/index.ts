@@ -10,6 +10,8 @@ import { createSessionWatcherService } from "./application/session-watcher-servi
 import TelegramBot from "node-telegram-bot-api";
 import { OPEN_CODE_ADAPTER_MODE } from "./infrastructure/opencode-adapter-mode";
 import { createOpenCodeCliMirrorService } from "./application/opencode-cli-mirror-service";
+import { createLocalTerminalLauncher } from "./infrastructure/local-terminal-launcher";
+import { hasSessionByOpenCodeSessionId } from "./infrastructure/opencode-tmux-host";
 
 interface StartupDependencies {
   readonly loadConfig: typeof loadConfig;
@@ -61,6 +63,9 @@ export async function bootstrapApplication(deps: StartupDependencies = DEFAULT_S
   const adapterMode = config.openCodeAdapter ?? OPEN_CODE_ADAPTER_MODE.HTTP;
   const isLocalCliLikeMode =
     adapterMode === OPEN_CODE_ADAPTER_MODE.CLI || adapterMode === OPEN_CODE_ADAPTER_MODE.PTY;
+  const localTerminalLauncher = createLocalTerminalLauncher({
+    timeoutMs: config.localTerminalLaunchTimeoutMs ?? 4000,
+  });
 
   let activeHandler: Parameters<typeof deps.createSessionWebhookReceiver>[0]["onEvent"] = async () => ({
     statusCode: 503,
@@ -104,6 +109,15 @@ export async function bootstrapApplication(deps: StartupDependencies = DEFAULT_S
     persistence,
     adapter,
     createWatcherRegistration: watcher?.createRegistration,
+    localHostOptions: {
+      allowedActorIds: config.allowedUserIds,
+      localHostActionsEnabled: config.localHostActionsEnabled,
+      attachLocalEnabled: config.attachLocalEnabled,
+      localHostConfirmationTtlMs: config.localHostConfirmationTtlMs,
+      isLocalHostEnvironmentReady: async () => localTerminalLauncher.isEnvironmentReady(),
+    },
+    localTerminalLauncher,
+    hasTmuxSessionBySessionId: hasSessionByOpenCodeSessionId,
     onAssistantMessageProduced: ({ sessionId, message }) => {
       cliMirror?.registerTelegramEcho(sessionId, message);
     },

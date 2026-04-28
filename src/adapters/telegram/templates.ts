@@ -106,6 +106,68 @@ export function formatLegacyNewDisabled(): string {
   });
 }
 
+export function formatNewSessionUnsupportedBackend(): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.INFO,
+    title: "/new no disponible",
+    lines: ["/new no está disponible en este backend. Usá /sesiones o /session <id>."]
+  });
+}
+
+export function formatNewSessionCreatedConfirmation(sessionId: string, projectId: string): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.SUCCESS,
+    title: "Sesión creada y vinculada",
+    context: {
+      project: projectId,
+      session: sessionId,
+      state: "session-linked",
+    },
+    lines: ["Ya podés enviar mensajes a la sesión activa."],
+  });
+}
+
+export function formatNewSessionCreatedNotLinked(sessionId: string): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.INFO,
+    title: "Sesión creada, no vinculada",
+    context: {
+      session: sessionId,
+    },
+    lines: [`Podés vincularla después con /sesiones o /session ${sessionId}.`],
+  });
+}
+
+export function formatNewSessionNoCandidate(): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.ERROR,
+    title: "No pude confirmar la creación de una sesión nueva",
+    lines: [
+      "OpenCode no expuso un sessionId nuevo dentro del timeout.",
+      "Abrí OpenCode localmente o usá /sesiones si la sesión ya aparece.",
+    ],
+  });
+}
+
+export function formatNewSessionAmbiguous(): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.NEEDS_ATTENTION,
+    title: "Encontré más de una sesión nueva para este proyecto",
+    lines: [
+      "No voy a vincular automáticamente para evitar enganchar la sesión equivocada.",
+      "Elegí una con /sesiones.",
+    ],
+  });
+}
+
+export function formatNewSessionToolingUnavailable(): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.ERROR,
+    title: "Herramientas locales no disponibles",
+    lines: ["OpenCode CLI o tmux no están disponibles. Verificá PATH e instalá las herramientas requeridas."],
+  });
+}
+
 export function formatSessionCreated(sessionId: string, projectId: string): string {
   return renderUxBlock({
     semantic: UX_SEMANTIC.SUCCESS,
@@ -405,9 +467,17 @@ export function formatCommandCatalog(catalog: readonly string[], unknownCommand?
   });
 }
 
-export function formatUsage(command: "project" | "session"): string {
+export function formatUsage(command: "project" | "session" | "new" | "attach-local"): string {
   if (command === "project") {
     return "Uso: /project <alias|projectId>";
+  }
+
+  if (command === "new") {
+    return "Usá /new <mensaje inicial>";
+  }
+
+  if (command === "attach-local") {
+    return "Uso: /attach-local";
   }
 
   return "Uso: /session <sessionId>";
@@ -672,6 +742,140 @@ export function formatDomainError(error: DomainError): string {
     lines: [
       message,
       "Si seguís bloqueado: verificá /status y recuperá contexto con /project + /sesiones o /session.",
+    ],
+  });
+}
+
+export function formatDangerousActionDisabled(): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.INFO,
+    title: "Capacidad sensible deshabilitada",
+    lines: [
+      "Esta capacidad abre una terminal en la máquina local y está deshabilitada por configuración.",
+      "Activá ENABLE_LOCAL_HOST_ACTIONS y ENABLE_ATTACH_LOCAL para habilitarla.",
+    ],
+  });
+}
+
+export function formatDangerousActionPrivateOnly(): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.ERROR,
+    title: "Acción sensible sólo en chat privado",
+    lines: [
+      "Las capacidades de host local sólo se aceptan en chats privados.",
+      "Reintentá desde tu chat directo con el bot.",
+    ],
+  });
+}
+
+export function formatDangerousActionConfirmation(input: {
+  readonly projectId?: string;
+  readonly sessionId?: string;
+  readonly targetEnvironment: string;
+  readonly expiresAt: string;
+  readonly tmuxSessionName?: string;
+}): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.NEEDS_ATTENTION,
+    title: "Confirmación sensible requerida",
+    context: {
+      project: input.projectId,
+      session: input.sessionId,
+      state: "local-host-dangerous",
+    },
+    lines: [
+      "Voy a abrir una terminal local y ejecutar:",
+      `tmux attach -t ${input.tmuxSessionName ?? "tgoc_<session>"}`,
+      `Entorno: ${input.targetEnvironment}.`,
+      `Vence: ${input.expiresAt}`,
+      "¿Confirmás?",
+    ],
+  });
+}
+
+export function formatDangerousActionCancelled(): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.INFO,
+    title: "Acción sensible cancelada",
+    lines: ["Se descartó la confirmación pendiente. No se ejecutó ningún side effect local."],
+  });
+}
+
+export function formatDangerousActionContextChanged(reason?: string): string {
+  const detail =
+    reason === "expired"
+      ? "El TTL ya venció."
+      : reason === "context-mismatch"
+        ? "Cambió proyecto, sesión, actor o chat respecto del pedido original."
+        : "El contexto dejó de ser válido para esta acción.";
+
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.ERROR,
+    title: "Confirmación sensible inválida",
+    lines: [detail, "No se ejecutó ninguna acción sobre el host local."],
+  });
+}
+
+export function formatDangerousActionEnvironmentUnavailable(input?: {
+  readonly detail?: string;
+  readonly manualCommand?: string;
+}): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.ERROR,
+    title: "Entorno local no disponible",
+    lines: [
+      "No pude validar el entorno local para ejecutar esta acción sensible.",
+      input?.detail ? `Detalle: ${input.detail}` : "",
+      input?.manualCommand ? "Fallback manual:" : "",
+      input?.manualCommand ?? "",
+      "No se ejecutó ninguna acción sobre el host local.",
+    ].filter((entry) => entry.length > 0),
+  });
+}
+
+export function formatDangerousActionIdempotent(status: string): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.INFO,
+    title: "Confirmación ya procesada",
+    lines: [`Estado final: ${status}.`, "Este token es de un solo uso; no habrá una segunda ejecución."],
+  });
+}
+
+export function formatDangerousActionReady(message: string): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.SUCCESS,
+    title: "Hardening confirmado",
+    lines: [message],
+  });
+}
+
+export function formatAttachLocalManualFallback(input: {
+  readonly manualCommand: string;
+  readonly reason?: string;
+}): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.INFO,
+    title: "No pude abrir una terminal local automáticamente",
+    lines: [
+      "Ejecutá manualmente:",
+      input.manualCommand,
+      input.reason ? `Detalle: ${input.reason}` : "",
+    ].filter((entry) => entry.length > 0),
+  });
+}
+
+export function formatAttachLocalTmuxMissing(input: {
+  readonly tmuxSessionName: string;
+  readonly manualCommand: string;
+}): string {
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.ERROR,
+    title: "No encontré sesión tmux activa",
+    lines: [
+      `Target esperado: ${input.tmuxSessionName}`,
+      "Reasociá sesión con /sesiones o /session <id>.",
+      "Fallback manual:",
+      input.manualCommand,
     ],
   });
 }

@@ -17,6 +17,18 @@ export interface InterruptTmuxInput {
   readonly timeoutMs: number;
 }
 
+export interface StartTemporaryBootstrapSessionInput {
+  readonly token: string;
+  readonly dir: string;
+  readonly initialPrompt: string;
+  readonly timeoutMs: number;
+}
+
+export interface KillTmuxSessionByNameInput {
+  readonly sessionName: string;
+  readonly timeoutMs: number;
+}
+
 export class OpenCodeTmuxHostError extends Error {
   readonly kind: "not-installed" | "timeout" | "non-zero" | "session-missing";
   readonly details?: Readonly<Record<string, unknown>>;
@@ -42,6 +54,37 @@ export async function ensureHostSession(input: EnsureTmuxHostSessionInput): Prom
 
   await runTmux({
     args: ["new-session", "-d", "-s", sessionName, "-c", input.dir, "opencode", "--session", input.opencodeSessionId],
+    timeoutMs: input.timeoutMs,
+  });
+}
+
+export async function hasSessionByOpenCodeSessionId(input: {
+  readonly opencodeSessionId: string;
+  readonly timeoutMs: number;
+}): Promise<{ readonly exists: boolean; readonly tmuxSessionName: string }> {
+  const tmuxSessionName = toTmuxSessionName(input.opencodeSessionId);
+  const exists = await hasSession({ sessionName: tmuxSessionName, timeoutMs: input.timeoutMs });
+  return { exists, tmuxSessionName };
+}
+
+export async function startTemporaryBootstrapSession(input: StartTemporaryBootstrapSessionInput): Promise<string> {
+  const sessionName = toBootstrapTmuxSessionName(input.token);
+
+  await runTmux({
+    args: ["new-session", "-d", "-s", sessionName, "-c", input.dir, "opencode", "--prompt", input.initialPrompt],
+    timeoutMs: input.timeoutMs,
+  });
+
+  return sessionName;
+}
+
+export async function killSessionByName(input: KillTmuxSessionByNameInput): Promise<void> {
+  if (!(await hasSession({ sessionName: input.sessionName, timeoutMs: input.timeoutMs }))) {
+    return;
+  }
+
+  await runTmux({
+    args: ["kill-session", "-t", input.sessionName],
     timeoutMs: input.timeoutMs,
   });
 }
@@ -95,6 +138,16 @@ export function toTmuxSessionName(opencodeSessionId: string): string {
     .replace(/^-|-$/g, "") || "session";
 
   return `tgoc_${sanitized}`;
+}
+
+export function toBootstrapTmuxSessionName(token: string): string {
+  const sanitized = token
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .slice(0, 24) || "bootstrap";
+
+  return `tgoc_boot_${sanitized}`;
 }
 
 async function hasSession(input: { readonly sessionName: string; readonly timeoutMs: number }): Promise<boolean> {

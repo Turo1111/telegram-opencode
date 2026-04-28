@@ -3,13 +3,33 @@ import TelegramBot from "node-telegram-bot-api";
 import {
   ApplicationUseCases,
   CANCEL_SESSION_RESULT_STATUS,
+  CONFIRM_DANGEROUS_ACTION_RESULT_STATUS,
+  DangerousActionUseCases,
   SUBMIT_PENDING_PROMPT_RESULT_STATUS,
   StatusOutput,
 } from "../../application/use-cases";
-import { PersistenceDriver, PersistenceUnit } from "../../application/contracts";
-import { DomainError } from "../../domain/errors";
-import { PENDING_PROMPT_STATUS, PROMPT_TYPE } from "../../domain/entities";
 import {
+  PersistenceDriver,
+  PersistenceUnit,
+  SENSITIVE_ACTION_AUDIT_RESULT,
+} from "../../application/contracts";
+import { DomainError } from "../../domain/errors";
+import {
+  DANGEROUS_ACTION_CONFIRMATION_STATUS,
+  PENDING_PROMPT_STATUS,
+  PROMPT_TYPE,
+} from "../../domain/entities";
+import {
+  formatDangerousActionCancelled,
+  formatDangerousActionConfirmation,
+  formatDangerousActionContextChanged,
+  formatDangerousActionEnvironmentUnavailable,
+  formatDangerousActionDisabled,
+  formatDangerousActionIdempotent,
+  formatDangerousActionPrivateOnly,
+  formatDangerousActionReady,
+  formatAttachLocalManualFallback,
+  formatAttachLocalTmuxMissing,
   formatBusyCommandRejected,
   formatCancelNoActiveTask,
   formatCancelSuccess,
@@ -17,6 +37,12 @@ import {
   formatCommandCatalog,
   formatLegacyNewDisabled,
   formatLegacyRunCmdDisabled,
+  formatNewSessionAmbiguous,
+  formatNewSessionCreatedConfirmation,
+  formatNewSessionCreatedNotLinked,
+  formatNewSessionNoCandidate,
+  formatNewSessionToolingUnavailable,
+  formatNewSessionUnsupportedBackend,
   formatDomainError,
   formatFreeTextRejectedBusy,
   formatNoSessionGuide,
@@ -44,20 +70,32 @@ import { sendTelegramText, TELEGRAM_CONTENT_KIND, TelegramContentKind } from "./
 import { ADAPTER_ERROR_CODES } from "../../application/contracts";
 import { OPEN_CODE_ADAPTER_MODE, OpenCodeAdapterMode } from "../../infrastructure/opencode-adapter-mode";
 import {
+  assertLocalHostActionAllowed,
+  LOCAL_HOST_ACTION_GUARD_REASON,
+  LOCAL_HOST_ACTION_KIND,
+  resolveLocalHostFeature,
+  TELEGRAM_CHAT_TYPES,
+} from "../../application/local-host-hardening";
+import {
   inspectProjectSessions,
   PROJECT_SESSION_ASSOCIATION,
   PROJECT_SESSION_INSPECTION_RESULT_KIND,
   selectSafeProjectSessions,
 } from "../../infrastructure/opencode-project-sessions";
+import { toTmuxSessionName } from "../../infrastructure/opencode-tmux-host";
+import { ATTACH_LOCAL_EXECUTION_RESULT } from "../../domain/entities";
 
 export interface TelegramRouterDeps {
   bot: TelegramBot;
-  useCases: ApplicationUseCases;
+  useCases: ApplicationUseCases & Partial<DangerousActionUseCases>;
   persistence?: PersistenceDriver;
   compatRunCmdCommands: boolean;
   openCodeAdapterMode?: OpenCodeAdapterMode;
   openCodeControlTimeoutMs?: number;
   inspectProjectSessionsFn?: typeof inspectProjectSessions;
+  localHostActionsEnabled?: boolean;
+  attachLocalEnabled?: boolean;
+  localHostConfirmationTtlMs?: number;
 }
 
 const CLI_CANCEL_UNSUPPORTED_GUIDANCE =
@@ -95,6 +133,7 @@ export const TELEGRAM_COMMAND_INTENT_KIND = {
   SESSION: "session",
   NEW: "new",
   CANCEL: "cancel",
+  ATTACH_LOCAL: "attach-local",
   RUN: "run",
   UNKNOWN: "unknown",
 } as const;
@@ -106,6 +145,7 @@ export const COMMAND_POLICY = {
   READ_ONLY: "read-only",
   EXECUTION: "execution",
   MUTATING: "mutating",
+  LOCAL_HOST_DANGEROUS: "local-host-dangerous",
 } as const;
 
 export type CommandPolicy = (typeof COMMAND_POLICY)[keyof typeof COMMAND_POLICY];
@@ -139,6 +179,7 @@ const COMMAND_INTENT_POLICY = {
   [TELEGRAM_COMMAND_INTENT_KIND.PROJECT]: COMMAND_POLICY.READ_ONLY,
   [TELEGRAM_COMMAND_INTENT_KIND.SESSION]: COMMAND_POLICY.EXECUTION,
   [TELEGRAM_COMMAND_INTENT_KIND.NEW]: COMMAND_POLICY.EXECUTION,
+  [TELEGRAM_COMMAND_INTENT_KIND.ATTACH_LOCAL]: COMMAND_POLICY.LOCAL_HOST_DANGEROUS,
   [TELEGRAM_COMMAND_INTENT_KIND.RUN]: COMMAND_POLICY.EXECUTION,
   [TELEGRAM_COMMAND_INTENT_KIND.HELP]: COMMAND_POLICY.EXECUTION,
   [TELEGRAM_COMMAND_INTENT_KIND.UNKNOWN]: COMMAND_POLICY.EXECUTION,
@@ -158,11 +199,12 @@ const COMMAND_ALIASES = {
   n: TELEGRAM_COMMAND_INTENT_KIND.NEW,
   cancel: TELEGRAM_COMMAND_INTENT_KIND.CANCEL,
   c: TELEGRAM_COMMAND_INTENT_KIND.CANCEL,
+  "attach-local": TELEGRAM_COMMAND_INTENT_KIND.ATTACH_LOCAL,
   run: TELEGRAM_COMMAND_INTENT_KIND.RUN,
   cmd: TELEGRAM_COMMAND_INTENT_KIND.RUN,
 } as const;
 
-const COMMAND_CATALOG = [
+const BASE_COMMAND_CATALOG = [
   "/start | /help",
   "/status | /st",
   "/sesiones",
@@ -171,10 +213,25 @@ const COMMAND_CATALOG = [
   "/cancel | /c",
 ] as const;
 
+const DANGEROUS_COMMAND_CATALOG = [
+  "/attach-local — sensible/experimental",
+] as const;
+
 const DEFAULT_OPEN_CODE_CONTROL_TIMEOUT_MS = 5_000;
 const SESSION_SELECTION_CALLBACK_PREFIX = "sess";
+const DANGEROUS_ACTION_CALLBACK_PREFIX = "dha";
 const SESSION_SELECTION_CALLBACK_ACTION = {
   SELECT: "sel",
+  CONFIRM: "ok",
+  CANCEL: "no",
+} as const;
+
+const SESSION_SELECTION_TOKEN_ORIGIN = {
+  SESSION_SELECTION: "session-selection",
+  NEW_SESSION: "new-session",
+} as const;
+
+const DANGEROUS_ACTION_CALLBACK_ACTION = {
   CONFIRM: "ok",
   CANCEL: "no",
 } as const;
@@ -182,9 +239,20 @@ const SESSION_SELECTION_CALLBACK_ACTION = {
 type SessionSelectionCallbackAction =
   (typeof SESSION_SELECTION_CALLBACK_ACTION)[keyof typeof SESSION_SELECTION_CALLBACK_ACTION];
 
+type SessionSelectionTokenOrigin =
+  (typeof SESSION_SELECTION_TOKEN_ORIGIN)[keyof typeof SESSION_SELECTION_TOKEN_ORIGIN];
+
+type DangerousActionCallbackAction =
+  (typeof DANGEROUS_ACTION_CALLBACK_ACTION)[keyof typeof DANGEROUS_ACTION_CALLBACK_ACTION];
+
 interface SessionSelectionCallbackPayload {
   readonly action: SessionSelectionCallbackAction;
   readonly token: string;
+}
+
+interface DangerousActionCallbackPayload {
+  readonly action: DangerousActionCallbackAction;
+  readonly confirmationId: string;
 }
 
 interface SessionSelectionTokenRecord {
@@ -192,6 +260,7 @@ interface SessionSelectionTokenRecord {
   readonly projectId: string;
   readonly projectPath: string;
   readonly sessionId: string;
+  readonly origin: SessionSelectionTokenOrigin;
   readonly createdAt: number;
 }
 
@@ -214,7 +283,16 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
       const chatId = String(msg.chat.id);
 
       if (text.startsWith("/")) {
-        await handleCommand(deps, chatId, text, sessionSelectionTokens);
+        await handleCommand(
+          deps,
+          {
+            actorId: authContext?.actorId,
+            chatId,
+            chatType: msg.chat.type,
+          },
+          text,
+          sessionSelectionTokens
+        );
         return;
       }
 
@@ -238,6 +316,19 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
           query,
           payload: parsedSessionCallback,
           sessionSelectionTokens,
+        });
+        return;
+      }
+
+      const parsedDangerousCallback = parseDangerousActionCallbackPayload(query.data);
+      if (parsedDangerousCallback) {
+        await handleDangerousActionCallback({
+          deps,
+          actorId: authContext?.actorId,
+          chatId,
+          chatType: query.message?.chat.type,
+          query,
+          payload: parsedDangerousCallback,
         });
         return;
       }
@@ -443,26 +534,30 @@ function shouldDefensivelyRejectByAuthContext(
 
 async function handleCommand(
   deps: TelegramRouterDeps,
-  chatId: string,
+  commandContext: {
+    readonly actorId?: string;
+    readonly chatId: string;
+    readonly chatType: string;
+  },
   text: string,
   sessionSelectionTokens: Map<string, SessionSelectionTokenRecord>
 ): Promise<void> {
   const intent = parseCommandIntent(text);
   const policy = resolveCommandPolicy(intent);
-  const numericChatId = Number(chatId);
+  const numericChatId = Number(commandContext.chatId);
   const send = (message: string, contentKind: TelegramContentKind = TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE) =>
     sendTelegramText({ bot: deps.bot, chatId: numericChatId, text: message, contentKind });
 
   try {
     logger.info("Telegram route decision", {
-      chatId,
+      chatId: commandContext.chatId,
       routeDecision: TELEGRAM_ROUTE_DECISION.COMMAND,
       intentKind: intent.kind,
       aliasUsed: intent.aliasUsed,
       commandPolicy: policy,
     });
 
-    const statusResult = await deps.useCases.getStatus(chatId);
+    const statusResult = await deps.useCases.getStatus(commandContext.chatId);
     if (!statusResult.ok) {
       await send(formatDomainError(statusResult.error));
       return;
@@ -474,7 +569,7 @@ async function handleCommand(
     }
 
     if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.HELP) {
-      await send(formatCommandCatalog(COMMAND_CATALOG));
+      await send(formatCommandCatalog(buildCommandCatalog(deps, commandContext.chatType)));
       return;
     }
 
@@ -485,7 +580,7 @@ async function handleCommand(
       }
 
       const result = await deps.useCases.selectProject({
-        chatId,
+        chatId: commandContext.chatId,
         selector: intent.args,
       });
 
@@ -499,7 +594,7 @@ async function handleCommand(
     }
 
     if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.SESSIONS) {
-      const activeProject = await loadActiveProjectContext(deps.persistence, chatId);
+      const activeProject = await loadActiveProjectContext(deps.persistence, commandContext.chatId);
       if (!activeProject) {
         await send(formatProjectSessionsRequireProject());
         return;
@@ -524,10 +619,11 @@ async function handleCommand(
       const keyboard = {
         inline_keyboard: sessions.map((session) => {
           const token = registerSessionSelectionToken(sessionSelectionTokens, {
-            chatId,
+            chatId: commandContext.chatId,
             projectId: activeProject.projectId,
             projectPath: inspection.projectPath,
             sessionId: session.sessionId,
+            origin: SESSION_SELECTION_TOKEN_ORIGIN.SESSION_SELECTION,
           });
 
           return [
@@ -552,7 +648,7 @@ async function handleCommand(
       }
 
       const result = await deps.useCases.attachSession({
-        chatId,
+        chatId: commandContext.chatId,
         sessionId: intent.args,
       });
 
@@ -565,8 +661,178 @@ async function handleCommand(
       return;
     }
 
+    if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.ATTACH_LOCAL) {
+      if (intent.args) {
+        await send(formatUsage("attach-local"));
+        return;
+      }
+
+      const featureResolution = resolveLocalHostFeature({
+        action: LOCAL_HOST_ACTION_KIND.ATTACH_LOCAL,
+        localHostActionsEnabled: deps.localHostActionsEnabled ?? false,
+        attachLocalEnabled: deps.attachLocalEnabled ?? false,
+      });
+
+      if (!featureResolution.featureEnabled) {
+        auditSensitiveAction(commandContext, statusResult.value, {
+          result: SENSITIVE_ACTION_AUDIT_RESULT.REJECTED,
+          reason: LOCAL_HOST_ACTION_GUARD_REASON.FEATURE_DISABLED,
+          featureFlag: featureResolution.featureFlag,
+          targetEnvironment: featureResolution.targetEnvironment,
+        });
+        await send(formatDangerousActionDisabled());
+        return;
+      }
+
+      const guard = assertLocalHostActionAllowed({
+        actorId: commandContext.actorId,
+        chatType: commandContext.chatType,
+        featureEnabled: featureResolution.featureEnabled,
+        projectId: statusResult.value.projectId,
+        sessionId: statusResult.value.sessionId,
+      });
+
+      if (!guard.ok) {
+        auditSensitiveAction(commandContext, statusResult.value, {
+          result: SENSITIVE_ACTION_AUDIT_RESULT.REJECTED,
+          reason: guard.reason,
+          featureFlag: featureResolution.featureFlag,
+          targetEnvironment: featureResolution.targetEnvironment,
+        });
+
+        if (guard.reason === LOCAL_HOST_ACTION_GUARD_REASON.CHAT_NOT_PRIVATE) {
+          await send(formatDangerousActionPrivateOnly());
+          return;
+        }
+
+        await send(formatDangerousActionContextChanged());
+        return;
+      }
+
+      if (!deps.persistence) {
+        await send(formatDangerousActionContextChanged());
+        return;
+      }
+
+      const now = Date.now();
+      const nowIso = new Date(now).toISOString();
+      const expiresAt = new Date(now + (deps.localHostConfirmationTtlMs ?? 60_000)).toISOString();
+      const confirmationId = randomUUID();
+
+      await deps.persistence.runInTransaction(async (unit) => {
+        if (!unit.dangerousActionConfirmations || !statusResult.value.projectId || !statusResult.value.sessionId) {
+          throw new DomainError("UNAVAILABLE", "Dangerous action confirmation store unavailable");
+        }
+
+        await unit.dangerousActionConfirmations.upsert({
+          confirmationId,
+          actorId: commandContext.actorId ?? "unknown",
+          chatId: commandContext.chatId,
+          chatType: commandContext.chatType === "private" || commandContext.chatType === "group" || commandContext.chatType === "supergroup" || commandContext.chatType === "channel" ? commandContext.chatType : TELEGRAM_CHAT_TYPES.PRIVATE,
+          projectId: statusResult.value.projectId,
+          sessionId: statusResult.value.sessionId,
+          intent: LOCAL_HOST_ACTION_KIND.ATTACH_LOCAL,
+          featureFlag: featureResolution.featureFlag,
+          targetEnvironment: featureResolution.targetEnvironment,
+          status: DANGEROUS_ACTION_CONFIRMATION_STATUS.ACTIVE,
+          expiresAt,
+          createdAt: nowIso,
+        });
+      });
+
+      auditSensitiveAction(commandContext, statusResult.value, {
+        result: SENSITIVE_ACTION_AUDIT_RESULT.REQUESTED,
+        confirmationId,
+        featureFlag: featureResolution.featureFlag,
+        targetEnvironment: featureResolution.targetEnvironment,
+      });
+      auditSensitiveAction(commandContext, statusResult.value, {
+        result: SENSITIVE_ACTION_AUDIT_RESULT.CONFIRMATION_ISSUED,
+        confirmationId,
+        featureFlag: featureResolution.featureFlag,
+        targetEnvironment: featureResolution.targetEnvironment,
+      });
+
+      await deps.bot.sendMessage(numericChatId, formatDangerousActionConfirmation({
+        projectId: statusResult.value.projectId,
+        sessionId: statusResult.value.sessionId,
+        targetEnvironment: featureResolution.targetEnvironment,
+        expiresAt,
+        tmuxSessionName: statusResult.value.sessionId
+          ? toTmuxSessionName(statusResult.value.sessionId)
+          : undefined,
+      }), {
+        reply_markup: {
+          inline_keyboard: [[
+            {
+              text: "Confirmar",
+              callback_data: buildDangerousActionCallbackData(
+                DANGEROUS_ACTION_CALLBACK_ACTION.CONFIRM,
+                confirmationId
+              ),
+            },
+            {
+              text: "Cancelar",
+              callback_data: buildDangerousActionCallbackData(
+                DANGEROUS_ACTION_CALLBACK_ACTION.CANCEL,
+                confirmationId
+              ),
+            },
+          ]],
+        },
+      });
+      return;
+    }
+
     if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.NEW) {
-      await send(formatLegacyNewDisabled());
+      if (!intent.args) {
+        await send(formatUsage("new"));
+        return;
+      }
+
+      if (deps.openCodeAdapterMode !== OPEN_CODE_ADAPTER_MODE.PTY) {
+        await send(formatNewSessionUnsupportedBackend());
+        return;
+      }
+
+      const activeProject = await loadActiveProjectContext(deps.persistence, commandContext.chatId);
+      if (!activeProject) {
+        await send(formatProjectSessionsRequireProject());
+        return;
+      }
+
+      if (!deps.useCases.bootstrapSessionCandidate) {
+        await send(formatNewSessionUnsupportedBackend());
+        return;
+      }
+
+      const result = await deps.useCases.bootstrapSessionCandidate({
+        chatId: commandContext.chatId,
+        initialPrompt: intent.args,
+      });
+
+      if (!result.ok) {
+        const adapterCode = result.error.details?.adapterCode;
+        if (adapterCode === ADAPTER_ERROR_CODES.AMBIGUOUS_SESSION_CANDIDATE) {
+          await send(formatNewSessionAmbiguous());
+          return;
+        }
+
+        if (adapterCode === ADAPTER_ERROR_CODES.TIMEOUT || adapterCode === ADAPTER_ERROR_CODES.SESSION_NOT_FOUND) {
+          await send(formatNewSessionNoCandidate());
+          return;
+        }
+
+        if (adapterCode === ADAPTER_ERROR_CODES.UNAVAILABLE) {
+          await send(formatNewSessionToolingUnavailable());
+          return;
+        }
+
+        await send(formatDomainError(result.error));
+        return;
+      }
+
+      await send(formatNewSessionCreatedConfirmation(result.value.sessionId, result.value.projectId));
       return;
     }
 
@@ -590,7 +856,7 @@ async function handleCommand(
         return;
       }
 
-      const cancelResult = await deps.useCases.cancelSession({ chatId });
+      const cancelResult = await deps.useCases.cancelSession({ chatId: commandContext.chatId });
       if (!cancelResult.ok) {
         const adapterCode = cancelResult.error.details?.adapterCode;
         if (adapterCode === ADAPTER_ERROR_CODES.UNSUPPORTED) {
@@ -620,10 +886,10 @@ async function handleCommand(
       return;
     }
 
-    await send(formatCommandCatalog(COMMAND_CATALOG, intent.raw));
+    await send(formatCommandCatalog(buildCommandCatalog(deps, commandContext.chatType), intent.raw));
   } catch (error) {
     logger.error("Telegram command handling failed", {
-      chatId,
+      chatId: commandContext.chatId,
       command: intent.raw,
       message: error instanceof Error ? error.message : String(error),
     });
@@ -858,13 +1124,16 @@ async function handleSessionSelectionCallback(input: {
 
   if (input.payload.action === SESSION_SELECTION_CALLBACK_ACTION.CANCEL) {
     await input.deps.bot.answerCallbackQuery(input.query.id, {
-      text: "Vinculación cancelada.",
+      text: selection.origin === SESSION_SELECTION_TOKEN_ORIGIN.NEW_SESSION ? "Sesión no vinculada." : "Vinculación cancelada.",
       show_alert: false,
     });
     await sendTelegramText({
       bot: input.deps.bot,
       chatId: Number(input.chatId),
-      text: formatProjectSessionCancelled(),
+      text:
+        selection.origin === SESSION_SELECTION_TOKEN_ORIGIN.NEW_SESSION
+          ? formatNewSessionCreatedNotLinked(selection.sessionId)
+          : formatProjectSessionCancelled(),
     });
     return;
   }
@@ -941,6 +1210,158 @@ async function handleSessionSelectionCallback(input: {
   });
 }
 
+async function handleDangerousActionCallback(input: {
+  readonly deps: TelegramRouterDeps;
+  readonly actorId?: string;
+  readonly chatId: string;
+  readonly chatType?: string;
+  readonly query: TelegramBot.CallbackQuery;
+  readonly payload: DangerousActionCallbackPayload;
+}): Promise<void> {
+  const numericChatId = Number(input.chatId);
+
+  if (!input.deps.persistence) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "Confirmación no disponible.",
+      show_alert: false,
+    });
+    return;
+  }
+
+  const confirmation = await input.deps.persistence.runInTransaction(async (unit) => {
+    if (!unit.dangerousActionConfirmations) {
+      return undefined;
+    }
+
+    return unit.dangerousActionConfirmations.findByConfirmationId(input.payload.confirmationId);
+  });
+
+  if (!confirmation) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "Acción inválida o vencida.",
+      show_alert: false,
+    });
+    return;
+  }
+
+  if (input.payload.action === DANGEROUS_ACTION_CALLBACK_ACTION.CANCEL) {
+    const cancelled = await input.deps.persistence.runInTransaction(async (unit) => {
+      if (!unit.dangerousActionConfirmations) {
+        return undefined;
+      }
+
+      return unit.dangerousActionConfirmations.compareAndSetStatus({
+        confirmationId: input.payload.confirmationId,
+        fromStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.ACTIVE,
+        toStatus: DANGEROUS_ACTION_CONFIRMATION_STATUS.CANCELLED,
+        invalidatedReason: "user-cancelled",
+      });
+    });
+
+    const finalStatus = cancelled?.status ?? confirmation.status;
+    logger.audit({
+      actorId: confirmation.actorId,
+      chatId: confirmation.chatId,
+      chatType: confirmation.chatType,
+      action: confirmation.intent,
+      projectId: confirmation.projectId,
+      sessionId: confirmation.sessionId,
+      result: SENSITIVE_ACTION_AUDIT_RESULT.CANCELLED,
+      reason:
+        finalStatus === DANGEROUS_ACTION_CONFIRMATION_STATUS.CANCELLED
+          ? "user-cancelled"
+          : "already-terminal",
+      timestamp: new Date().toISOString(),
+      confirmationId: confirmation.confirmationId,
+      featureFlag: confirmation.featureFlag,
+      targetEnvironment: confirmation.targetEnvironment,
+    });
+
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "Acción cancelada.",
+      show_alert: false,
+    });
+    await sendTelegramText({
+      bot: input.deps.bot,
+      chatId: numericChatId,
+      text:
+        finalStatus === DANGEROUS_ACTION_CONFIRMATION_STATUS.CANCELLED
+          ? formatDangerousActionCancelled()
+          : formatDangerousActionIdempotent(finalStatus),
+    });
+    return;
+  }
+
+  if (!input.actorId || !input.chatType || !input.deps.useCases.confirmDangerousAction) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "No puedo confirmar esta acción en esta instancia.",
+      show_alert: false,
+    });
+    return;
+  }
+
+  const result = await input.deps.useCases.confirmDangerousAction({
+    actorId: input.actorId,
+    chatId: input.chatId,
+    chatType: input.chatType,
+    confirmationId: input.payload.confirmationId,
+  });
+
+  if (!result.ok) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "No pude confirmar la acción.",
+      show_alert: false,
+    });
+    await sendTelegramText({
+      bot: input.deps.bot,
+      chatId: numericChatId,
+      text: formatDomainError(result.error),
+    });
+    return;
+  }
+
+  await input.deps.bot.answerCallbackQuery(input.query.id, {
+    text:
+      result.value.status === CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.CONFIRMED
+        ? "Confirmación aceptada."
+        : "Confirmación ya procesada.",
+    show_alert: false,
+  });
+
+  const message =
+    result.value.status === CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.CONFIRMED
+      ? result.value.attachLocal?.result === ATTACH_LOCAL_EXECUTION_RESULT.FAILED
+        ? result.value.reason === "tmux-session-missing"
+          ? formatAttachLocalTmuxMissing({
+              tmuxSessionName: result.value.attachLocal.tmuxSessionName,
+              manualCommand: result.value.attachLocal.manualCommand,
+            })
+          : formatAttachLocalManualFallback({
+              manualCommand: result.value.attachLocal.manualCommand,
+              reason: result.value.attachLocal.reason,
+            })
+        : formatDangerousActionReady(result.value.message)
+      : result.value.status === CONFIRM_DANGEROUS_ACTION_RESULT_STATUS.IDEMPOTENT
+        ? formatDangerousActionIdempotent(result.value.confirmationStatus)
+        : result.value.reason === LOCAL_HOST_ACTION_GUARD_REASON.ENVIRONMENT_UNAVAILABLE
+          ? formatDangerousActionEnvironmentUnavailable({
+              detail: result.value.message,
+              manualCommand: result.value.attachLocal?.manualCommand,
+            })
+          : result.value.attachLocal?.manualCommand
+            ? formatAttachLocalManualFallback({
+                manualCommand: result.value.attachLocal.manualCommand,
+                reason: result.value.reason,
+              })
+        : formatDangerousActionContextChanged(result.value.reason);
+
+  await sendTelegramText({
+    bot: input.deps.bot,
+    chatId: numericChatId,
+    text: message,
+  });
+}
+
 async function loadActiveProjectContext(
   persistence: PersistenceDriver | undefined,
   chatId: string
@@ -1007,6 +1428,13 @@ function buildSessionSelectionCallbackData(action: SessionSelectionCallbackActio
   return `${SESSION_SELECTION_CALLBACK_PREFIX}:${action}:${token}`;
 }
 
+function buildDangerousActionCallbackData(
+  action: DangerousActionCallbackAction,
+  confirmationId: string
+): string {
+  return `${DANGEROUS_ACTION_CALLBACK_PREFIX}:${action}:${confirmationId}`;
+}
+
 function parseSessionSelectionCallbackPayload(data: string | undefined): SessionSelectionCallbackPayload | undefined {
   if (!data || !data.startsWith(`${SESSION_SELECTION_CALLBACK_PREFIX}:`)) {
     return undefined;
@@ -1047,6 +1475,73 @@ function parsePromptCallbackPayload(data: string | undefined): { promptId: strin
     promptId: promptId.trim(),
     choice,
   };
+}
+
+function parseDangerousActionCallbackPayload(data: string | undefined): DangerousActionCallbackPayload | undefined {
+  if (!data || !data.startsWith(`${DANGEROUS_ACTION_CALLBACK_PREFIX}:`)) {
+    return undefined;
+  }
+
+  const [prefix, action, confirmationId] = data.split(":");
+  if (
+    prefix !== DANGEROUS_ACTION_CALLBACK_PREFIX ||
+    !confirmationId ||
+    !action ||
+    !Object.values(DANGEROUS_ACTION_CALLBACK_ACTION).includes(action as DangerousActionCallbackAction)
+  ) {
+    return undefined;
+  }
+
+  return {
+    action: action as DangerousActionCallbackAction,
+    confirmationId,
+  };
+}
+
+export function buildCommandCatalog(deps: TelegramRouterDeps, chatType: string): readonly string[] {
+  const catalog: string[] = [...BASE_COMMAND_CATALOG];
+  if (deps.openCodeAdapterMode === OPEN_CODE_ADAPTER_MODE.PTY) {
+    catalog.push("/new | /n <mensaje inicial> — crear y vincular sesión PTY");
+  }
+
+  const featureResolution = resolveLocalHostFeature({
+    action: LOCAL_HOST_ACTION_KIND.ATTACH_LOCAL,
+    localHostActionsEnabled: deps.localHostActionsEnabled ?? false,
+    attachLocalEnabled: deps.attachLocalEnabled ?? false,
+  });
+
+  if (chatType === TELEGRAM_CHAT_TYPES.PRIVATE && featureResolution.featureEnabled) {
+    catalog.push(...DANGEROUS_COMMAND_CATALOG);
+  }
+
+  return catalog;
+}
+
+function auditSensitiveAction(
+  commandContext: { readonly actorId?: string; readonly chatId: string; readonly chatType: string },
+  status: StatusOutput,
+  input: {
+    readonly result: (typeof SENSITIVE_ACTION_AUDIT_RESULT)[keyof typeof SENSITIVE_ACTION_AUDIT_RESULT];
+    readonly reason?: string;
+    readonly confirmationId?: string;
+    readonly featureFlag?: string;
+    readonly targetEnvironment?: string;
+  }
+): void {
+  logger.audit({
+    actorId: commandContext.actorId,
+    chatId: commandContext.chatId,
+    chatType: commandContext.chatType,
+    action: LOCAL_HOST_ACTION_KIND.ATTACH_LOCAL,
+    projectId: status.projectId,
+    sessionId: status.sessionId,
+    result: input.result,
+    reason: input.reason,
+    timestamp: new Date().toISOString(),
+    confirmationId: input.confirmationId,
+    featureFlag: input.featureFlag,
+    targetEnvironment: input.targetEnvironment,
+  });
 }
 
 async function findActivePromptByStatus(deps: PersistenceDriver | undefined, status: StatusOutput) {

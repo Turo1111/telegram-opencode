@@ -1,3 +1,5 @@
+import { SensitiveActionAuditEvent } from "./application/contracts";
+
 type Level = "info" | "error";
 
 export const LOCK_OUTCOME = {
@@ -46,5 +48,8 @@ export const logger = {
   },
   prompt(message: string, meta: PromptLogMeta) {
     console.log(format("info", message, meta));
+  },
+  audit(event: SensitiveActionAuditEvent) {
+    console.log(format("info", "Sensitive action audit", event as unknown as Record<string, unknown>));
   },
 };

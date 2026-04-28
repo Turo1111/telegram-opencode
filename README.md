@@ -10,16 +10,17 @@ Bot local de Telegram para operar sesiones reales de OpenCode desde Telegram.
 - Restringe el acceso por **allowlist** de Telegram `from.id`.
 - Consulta sesiones reales de OpenCode para el proyecto activo.
 - Permite vincular una sesión desde Telegram con `/sesiones` + confirmación.
+- Permite crear y vincular una sesión PTY con `/new <mensaje inicial>`.
 - Reenvía texto libre a la sesión activa ya vinculada.
 - Mantiene estado local en `data/`.
 - Responde en **español**.
 
 ## Flujo operativo soportado
 
-1. Abrís o continuás una sesión real de OpenCode desde tu máquina/WSL.
+1. Abrís o continuás una sesión real de OpenCode desde tu máquina/WSL, o pedís bootstrap best-effort con `/new`.
 2. Corrés este bot localmente.
 3. En Telegram seleccionás el proyecto activo con `/project <ruta-local>`.
-4. Ejecutás `/sesiones`, elegís una sesión real del proyecto y confirmás la vinculación.
+4. Ejecutás `/sesiones`, elegís una sesión real del proyecto y confirmás la vinculación; o ejecutás `/new <mensaje inicial>` para crear y vincular automáticamente.
 5. Desde ese momento mandás texto libre al chat y el bot lo reenvía a la sesión activa.
 
 La fuente de verdad del listado es OpenCode CLI:
@@ -36,7 +37,10 @@ No se listan procesos locales del wrapper. Se listan sesiones reales de OpenCode
 2. **Este proceso Node.js** valida que el usuario esté autorizado.
 3. El bot resuelve el **proyecto activo** del chat.
 4. Para `/sesiones`, consulta OpenCode CLI y filtra por el árbol del proyecto activo.
-5. Para texto libre, reenvía el mensaje a la sesión PTY ya vinculada.
+5. Para `/new <mensaje inicial>`, inicia OpenCode en un tmux temporal con `opencode --prompt`, descubre un único `sessionId` por diff conservador y lo vincula automáticamente.
+6. Para texto libre, reenvía el mensaje a la sesión PTY ya vinculada.
+
+`/new <mensaje inicial>` es best-effort y fail-closed: si OpenCode no expone exactamente una sesión nueva para el proyecto activo, el bot no vincula nada. No ejecuta shell arbitrario; sólo operaciones fijas con `opencode`/`tmux` y argumentos separados.
 
 No hay magia: hay un adaptador de entrada (Telegram), una capa de aplicación, persistencia local y un adaptador hacia OpenCode.
 
@@ -100,7 +104,7 @@ LOCALE=es
 2. Obtené tu **Telegram `from.id`**.
 3. Configurá `.env` con `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_ID` y `OPEN_CODE_ADAPTER=pty`.
 4. Instalá dependencias con `npm install`.
-5. Abrí o continuá una sesión real de OpenCode desde tu terminal.
+5. Abrí o continuá una sesión real de OpenCode desde tu terminal, o usá `/new <mensaje inicial>` desde Telegram después de elegir proyecto.
 6. Corré el bot:
 
 ```bash
@@ -112,6 +116,8 @@ npm run dev
 ```text
 /project <ruta-local>
 /sesiones
+# o
+/new arrancá revisando el README
 ```
 
 8. Elegí la sesión, confirmá y empezá a mandar texto libre.
@@ -123,12 +129,16 @@ npm run dev
 - `/project` o `/p <ruta-local|alias|projectId>`
 - `/sesiones`
 - `/session` o `/s <sessionId>`
+- `/new` o `/n <mensaje inicial>`
 - `/cancel` o `/c`
 - texto libre
 
+Con flags sensibles habilitadas también aparece:
+
+- `/attach-local` (private-only, con confirmación)
+
 ### Comandos y flujos fuera de foco
 
-- `/new` está deshabilitado en el flujo PTY-only.
 - `/run` está deshabilitado en el flujo PTY-only.
 - El README NO documenta `mock`, `start:local` ni flujos HTTP/CLI como operación soportada.
 
@@ -137,9 +147,11 @@ npm run dev
 ```text
 /project <ruta-local>
 /sesiones
+# alternativa best-effort:
+/new arrancá revisando el README
 ```
 
-Después elegís una sesión real del proyecto, confirmás la vinculación y ya podés mandar texto libre.
+Con `/sesiones` elegís una sesión real y confirmás. Con `/new <mensaje inicial>` queda creada y vinculada en el mismo paso.
 
 ### Fallback manual
 
@@ -215,6 +227,9 @@ npm run verify:rfc8
 npm run verify:rfc9
 npm run verify:rfc10
 npm run verify:rfc11
+npm run verify:rfc12
+npm run verify:rfc13
+npm run verify:rfc14
 ```
 
 ### Nota sobre scripts legacy
@@ -233,7 +248,18 @@ Revisá esto en orden:
 4. El proceso está corriendo con `npm run dev`.
 5. `opencode` está en `PATH`.
 6. `tmux` está instalado y visible en `PATH`.
-7. Ya existe una sesión real de OpenCode para vincular.
+7. Ya existe una sesión real de OpenCode para vincular, o `/new` logra descubrir exactamente una sesión nueva.
+
+### `/new <mensaje inicial>` no vincula nada
+
+Diseño intencional. Causas comunes:
+
+- OpenCode no creó una sesión listable dentro del timeout;
+- otro proceso creó sesiones en paralelo y hay ambigüedad;
+- la sesión nueva no trae path confiable del proyecto;
+- falta `opencode` o `tmux` en `PATH`.
+
+Recuperación: abrí OpenCode localmente y usá `/sesiones`, o vinculá manual con `/session <sessionId>`.
 
 ### `/sesiones` no muestra nada
 

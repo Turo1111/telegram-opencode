@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   ActiveTaskRepository,
   BindingRepository,
+  DangerousActionConfirmationRepository,
   PendingPromptRepository,
   RECOVERY_STATUS,
   RECOVERY_REASON,
@@ -16,6 +17,7 @@ import { Config } from "../../config";
 import {
   ActiveTask,
   ChatBinding,
+  DangerousActionConfirmation,
   OperationalState,
   PendingPrompt,
   Project,
@@ -31,6 +33,7 @@ interface JsonStoreData {
   states: Record<string, OperationalState>;
   tasks: Record<string, ActiveTask>;
   pendingPrompts: Record<string, PendingPrompt>;
+  dangerousActionConfirmations: Record<string, DangerousActionConfirmation>;
 }
 
 const EMPTY_STORE: JsonStoreData = {
@@ -40,6 +43,7 @@ const EMPTY_STORE: JsonStoreData = {
   states: {},
   tasks: {},
   pendingPrompts: {},
+  dangerousActionConfirmations: {},
 };
 
 export async function createJsonPersistenceDriver(config: Config): Promise<PersistenceDriver> {
@@ -165,6 +169,50 @@ function sanitizeStore(value: unknown): JsonStoreData {
     states: sanitizeStateRecord(candidate.states),
     tasks: sanitizeRecord<ActiveTask>(candidate.tasks),
     pendingPrompts: sanitizePendingPromptRecord(candidate.pendingPrompts),
+    dangerousActionConfirmations: sanitizeDangerousActionConfirmationRecord(
+      candidate.dangerousActionConfirmations
+    ),
+  };
+}
+
+function sanitizeDangerousActionConfirmationRecord(
+  value: unknown
+): Record<string, DangerousActionConfirmation> {
+  const unsafeConfirmations = sanitizeRecord<DangerousActionConfirmation>(value);
+  const result: Record<string, DangerousActionConfirmation> = {};
+
+  for (const [confirmationId, confirmation] of Object.entries(unsafeConfirmations)) {
+    result[confirmationId] = normalizeDangerousActionConfirmation(confirmation);
+  }
+
+  return result;
+}
+
+function normalizeDangerousActionConfirmation(
+  confirmation: DangerousActionConfirmation
+): DangerousActionConfirmation {
+  return {
+    ...confirmation,
+    usedAt: typeof confirmation.usedAt === "string" ? confirmation.usedAt : undefined,
+    invalidatedReason:
+      typeof confirmation.invalidatedReason === "string" ? confirmation.invalidatedReason : undefined,
+    executionResult:
+      confirmation.executionResult === "requested" || confirmation.executionResult === "failed"
+        ? confirmation.executionResult
+        : undefined,
+    executionReason:
+      typeof confirmation.executionReason === "string" ? confirmation.executionReason : undefined,
+    launcher:
+      confirmation.launcher === "wt" ||
+      confirmation.launcher === "powershell" ||
+      confirmation.launcher === "manual-fallback"
+        ? confirmation.launcher
+        : undefined,
+    tmuxSessionName:
+      typeof confirmation.tmuxSessionName === "string" ? confirmation.tmuxSessionName : undefined,
+    manualCommand:
+      typeof confirmation.manualCommand === "string" ? confirmation.manualCommand : undefined,
+    executedAt: typeof confirmation.executedAt === "string" ? confirmation.executedAt : undefined,
   };
 }
 
@@ -274,6 +322,7 @@ function cloneData(data: JsonStoreData): JsonStoreData {
     states: { ...data.states },
     tasks: { ...data.tasks },
     pendingPrompts: { ...data.pendingPrompts },
+    dangerousActionConfirmations: { ...data.dangerousActionConfirmations },
   };
 }
 
@@ -298,8 +347,9 @@ function createJsonUnit(data: JsonStoreData): PersistenceUnit {
   const states = createStateRepository(data);
   const tasks = createActiveTaskRepository(data);
   const pendingPrompts = createPendingPromptRepository(data);
+  const dangerousActionConfirmations = createDangerousActionConfirmationRepository(data);
 
-  return { projects, sessions, bindings, states, tasks, pendingPrompts };
+  return { projects, sessions, bindings, states, tasks, pendingPrompts, dangerousActionConfirmations };
 }
 
 function createProjectRepository(data: JsonStoreData): ProjectRepository {
@@ -437,4 +487,99 @@ function createPendingPromptRepository(data: JsonStoreData): PendingPromptReposi
       data.pendingPrompts[prompt.promptId] = { ...prompt };
     },
   };
+}
+
+function createDangerousActionConfirmationRepository(
+  data: JsonStoreData
+): DangerousActionConfirmationRepository {
+  return {
+    async compareAndSetStatus(input) {
+      const existing = data.dangerousActionConfirmations[input.confirmationId];
+      if (!existing || existing.status !== input.fromStatus) {
+        return undefined;
+      }
+
+      const updated: DangerousActionConfirmation = {
+        ...existing,
+        status: input.toStatus,
+        usedAt: input.usedAt ?? existing.usedAt,
+        invalidatedReason: input.invalidatedReason ?? existing.invalidatedReason,
+      };
+
+      data.dangerousActionConfirmations[input.confirmationId] = updated;
+      return updated;
+    },
+    async findByConfirmationId(confirmationId) {
+      return data.dangerousActionConfirmations[confirmationId];
+    },
+    async invalidateActiveByChat(input) {
+      return invalidateActiveDangerousActionConfirmations(
+        data,
+        (entry) => entry.chatId === input.chatId,
+        input.reason
+      );
+    },
+    async invalidateActiveByProject(input) {
+      return invalidateActiveDangerousActionConfirmations(
+        data,
+        (entry) => entry.chatId === input.chatId && entry.projectId === input.projectId,
+        input.reason
+      );
+    },
+    async invalidateActiveBySession(input) {
+      return invalidateActiveDangerousActionConfirmations(
+        data,
+        (entry) => entry.chatId === input.chatId && entry.sessionId === input.sessionId,
+        input.reason
+      );
+    },
+    async listAll() {
+      return Object.values(data.dangerousActionConfirmations).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    },
+    async recordExecutionOutcome(input) {
+      const existing = data.dangerousActionConfirmations[input.confirmationId];
+      if (!existing) {
+        return undefined;
+      }
+
+      const updated: DangerousActionConfirmation = {
+        ...existing,
+        executionResult: input.executionResult,
+        executionReason: input.executionReason,
+        launcher: input.launcher,
+        tmuxSessionName: input.tmuxSessionName,
+        manualCommand: input.manualCommand,
+        executedAt: input.executedAt,
+      };
+
+      data.dangerousActionConfirmations[input.confirmationId] = updated;
+      return updated;
+    },
+    async upsert(confirmation) {
+      data.dangerousActionConfirmations[confirmation.confirmationId] = { ...confirmation };
+    },
+  };
+}
+
+function invalidateActiveDangerousActionConfirmations(
+  data: JsonStoreData,
+  predicate: (entry: DangerousActionConfirmation) => boolean,
+  reason: string
+): number {
+  let invalidatedCount = 0;
+
+  for (const [confirmationId, confirmation] of Object.entries(data.dangerousActionConfirmations)) {
+    if (confirmation.status !== "active" || !predicate(confirmation)) {
+      continue;
+    }
+
+    data.dangerousActionConfirmations[confirmationId] = {
+      ...confirmation,
+      status: "invalidated",
+      invalidatedReason: reason,
+    };
+    invalidatedCount += 1;
+  }
+
+  return invalidatedCount;
 }
