@@ -1,0 +1,269 @@
+# RFC-020 Spec — Catálogo dinámico de agentes desde OpenCode
+## Delta specs for change "rfc20-fix-agents"
+
+## 1. Requirements
+
+### 1.1 Functional
+
+| ID | Requirement | Priority |
+|----|------------|----------|
+| F01 | `listAgents?()` method on `OpenCodeSessionAdapter` interface returning `Result<AgentCatalogResult>` | P0 |
+| F02 | HTTP adapter: `POST /opencode/agents` returns `{ agents: [{ id, label? }] }`. Cache with TTL 30s. On failure → degraded with cache or `{ ok: false }`. | P0 |
+| F03 | CLI adapter: `opencode agents` CLI command → parse stdout line-by-line. Cache TTL 30s. | P0 |
+| F04 | PTY adapter: delegate to `opencode agents` CLI (same as CLI). Cache TTL 30s with `pty:` prefix. | P0 |
+| F05 | `listSupportedAgents()` in use-cases.ts returns `{ agents: readonly string[], degraded?: { reason: string } }`. Contract signature changes. | P0 |
+| F06 | `setActiveAgent()` validates agent against dynamic catalog (not just `isSupportedAgent()`). Falls back to `FALLBACK_AGENTS` if catalog unavailable. | P0 |
+| F07 | `isSupportedAgent()` remains as validation against `FALLBACK_AGENTS` for config/defaults usage only. | P1 |
+| F08 | `FALLBACK_AGENTS = ["build", "plan", "gentleman", "sdd-orchestrator"]` replaces `SUPPORTED_AGENTS` as the hardcoded safety net. | P0 |
+| F09 | Router `/agentes` shows degraded banner `⚠️` when `listSupportedAgents()` returns `degraded`. | P0 |
+| F10 | Router `/agente <nombre>` shows degraded warning when catalog unavailable. | P0 |
+| F11 | Mock: `POST /opencode/agents` → 200 with extended list (includes `sdd-orchestrator-frontend-cheap`). Fixtures: `UNSUPPORTED` (501), `UNAVAILABLE` (503). | P1 |
+| F12 | `logger.warn()` on every fallback-to-FALLBACK_AGENTS path with explicit reason. | P0 |
+
+### 1.2 Non-Functional
+
+| ID | Requirement | Threshold |
+|----|------------|-----------|
+| NF01 | Cache TTL ≤30s (same as ModelCatalogCache) | Max 30s wall-clock |
+| NF02 | Zero breaking changes in existing Telegram UX | All existing `/agentes`, `/agente`, `/agente <x>` flows remain functional |
+| NF03 | Backward compat for `SupportedAgent` type | `string` is supertype of previous union → no compilation errors |
+| NF04 | Existing RFC-016 verification tests pass with `FALLBACK_AGENTS` | All 4 original agents present in fallback |
+| NF05 | Zero new dependencies | Use existing cache infrastructure (Map + TTL) |
+
+## 2. Scenarios
+
+### 2.1 Happy: OpenCode returns agent list → Telegram shows dynamic agents
+
+**Trigger**: User sends `/agentes`. Adapter `listAgents()` returns `{ ok: true, agents: [build, plan, gentleman, sdd-orchestrator, sdd-orchestrator-frontend-cheap] }`.
+
+**Assert**:
+- `listSupportedAgents()` returns `{ agents: [build, plan, gentleman, sdd-orchestrator, sdd-orchestrator-frontend-cheap] }`
+- No `degraded` property
+- Router shows `formatAgentList()` with full list + inline keyboard
+- User can select `sdd-orchestrator-frontend-cheap` via callback
+- `setActiveAgent("sdd-orchestrator-frontend-cheap")` succeeds
+
+### 2.2 Degraded: OpenCode unavailable → Telegram shows FALLBACK_AGENTS + warning
+
+**Trigger**: User sends `/agentes`. Adapter `listAgents()` returns `{ ok: false }` or throws timeout/unavailable.
+
+**Assert**:
+- `listSupportedAgents()` returns `{ agents: ["build", "plan", "gentleman", "sdd-orchestrator"], degraded: { reason: "timeout" | "unavailable" | "unsupported" } }`
+- `logger.warn()` called with `[agent-catalog]` prefix and explicit reason
+- Router shows banner `⚠️ Catálogo remoto de agentes no disponible ({reason}). Mostrando lista por defecto.` above agent list
+- User can still select from `FALLBACK_AGENTS`
+- `formatAgentList()` called with `["build", "plan", "gentleman", "sdd-orchestrator"]`
+
+### 2.3 Mixed: Some agents removed from catalog → user sees current list
+
+**Trigger**: OpenCode removes `sdd-orchestrator` from its catalog. `listAgents()` returns `[build, plan, gentleman]`.
+
+**Assert**:
+- `listSupportedAgents()` returns only `[build, plan, gentleman]`
+- No degraded (this is not a failure, it's the live catalog)
+- User sees current list without `sdd-orchestrator`
+- Selecting `sdd-orchestrator` → rejected by `setActiveAgent()` dynamic validation
+- User gets `formatInvalidAgent([build, plan, gentleman])`
+
+### 2.4 Invalid: User tries agent not in catalog → "Agente no válido" with current list
+
+**Trigger**: User sends `/agente nonexistent-agent`. Catalog is dynamic from OpenCode.
+
+**Assert**:
+- `setActiveAgent()` fetches catalog, `nonexistent-agent` not found
+- Returns error `VALIDATION_ERROR` with message `"Agente no válido"`
+- Router shows `formatInvalidAgent()` with current catalog agent list
+- In degraded mode: shows `formatInvalidAgent(FALLBACK_AGENTS)` + banner warning
+
+### 2.5 CLI missing: `opencode agents` command doesn't exist → fallback + log
+
+**Trigger**: CLI/PTY adapter calls `opencode agents`, command fails (not found / non-zero exit).
+
+**Assert**:
+- Adapter returns `{ ok: false, error: { code: UNSUPPORTED } }` (or `UNAVAILABLE`)
+- `listSupportedAgents()` falls back to `FALLBACK_AGENTS`
+- `logger.warn()` called with `[agent-catalog] Fallback: "unsupported" - using FALLBACK_AGENTS`
+- Router shows degraded banner
+
+### 2.6 Adapter missing: adapter has no `listAgents()` → graceful fallback
+
+**Trigger**: Adapter implementation does not implement `listAgents?()` (e.g., custom adapter).
+
+**Assert**:
+- `listSupportedAgents()` checks if `deps.adapter.listAgents` is undefined
+- Returns `{ agents: FALLBACK_AGENTS, degraded: { reason: "unsupported" } }`
+- `logger.warn()` called with `[agent-catalog] Adapter does not support listAgents — using FALLBACK_AGENTS`
+- No crash or type error
+
+## 3. Acceptance Criteria
+
+From RFC-020 section 9 (numbered as in RFC):
+
+1. `/agentes` muestra agentes dinámicos desde OpenCode cuando el adapter lo soporta.
+2. `/agente <id>` acepta agentes del catálogo dinámico aunque no estén en `FALLBACK_AGENTS`.
+3. Cuando `/opencode/agents` falla (timeout/4xx/5xx), se usa `FALLBACK_AGENTS` con banner `⚠️` en Telegram + `logger.warn()` en consola.
+4. Cache respeta TTL de 30s y no sirve datos stale por más de 30s.
+5. El handler `/agentes` muestra banner degradado cuando `listSupportedAgents()` devuelve `degraded`.
+6. El handler `/agente <nombre>` muestra aviso degradado cuando el catálogo no está disponible.
+7. Cada entrada a fallback queda registrada en consola con `logger.warn()` y razón explícita.
+8. Mock devuelve lista extendida de agentes (incluyendo `sdd-orchestrator-frontend-cheap`). *(RFC-020 section 9, second item 5)*
+9. Tests existentes de RFC-016 pasan sin modificación (fallback cubre los 4 agentes originales).
+10. `SupportedAgent` type cambia de union literal a `string` — sin errores de compilación.
+
+Additional criteria from discovery:
+
+11. Template functions `formatAgentList()` y `formatInvalidAgent()` no requieren cambios de firma (ya aceptan `readonly string[]`).
+12. `AgentSelection.activeAgent` type cambia de `SupportedAgent` (union literal) a `string`.
+13. `SetActiveAgentOutput.activeAgent` type cambia de `SupportedAgent` a `string`.
+14. `configureSessionAgent.agent` parameter type cambia de `SupportedAgent` a `string`.
+15. `sendMessage.agent` y `runCommand.agent` parameter types cambian de `SupportedAgent` a `string`.
+
+## 4. Contract Changes
+
+### 4.1 New types in `contracts.ts`
+
+```ts
+export const AGENT_CATALOG_DEGRADE_REASON = {
+  TIMEOUT: "timeout",
+  UNAVAILABLE: "unavailable",
+  UNSUPPORTED: "unsupported",
+  UPSTREAM: "upstream",
+} as const;
+
+export type AgentCatalogDegradeReason =
+  (typeof AGENT_CATALOG_DEGRADE_REASON)[keyof typeof AGENT_CATALOG_DEGRADE_REASON];
+
+export interface AgentCatalogItem {
+  readonly id: string;
+  readonly label?: string;
+}
+
+export interface AgentCatalogResult {
+  readonly ok: boolean;
+  readonly agents: readonly AgentCatalogItem[];
+  readonly fetchedAt: string;
+  readonly degraded?: {
+    readonly reason: AgentCatalogDegradeReason;
+    readonly usingCache: boolean;
+  };
+}
+```
+
+### 4.2 Modified interface in `contracts.ts`
+
+```ts
+export interface OpenCodeSessionAdapter {
+  // ... existing methods ...
+  listAgents?(input: {
+    projectId?: string;
+    sessionId?: string;
+    chatId: string;
+  }): Promise<Result<AgentCatalogResult>>;
+}
+```
+
+### 4.3 Modified return type in `use-cases.ts`
+
+```ts
+// listSupportedAgents return changes from:
+Promise<readonly SupportedAgent[]>
+// to:
+Promise<{ agents: readonly string[]; degraded?: { reason: string } }>
+```
+
+## 5. Implementation Notes
+
+### 5.1 Cache strategy
+
+- Same `Map<string, CacheEntry>` pattern as `ModelCatalogCache` in session adapter.
+- Cache key format: `agent::{chatId}::{projectId ?? "-"}::{sessionId ?? "-"}`
+- TTL: `AGENT_CATALOG_CACHE_TTL_MS = 30_000`
+- On failure: serve cache if exists + still fresh; else return `{ ok: false }` with `degraded`
+- On failure without cache: return `{ ok: false, agents: [], degraded: { reason, usingCache: false } }`
+
+### 5.2 `listSupportedAgents()` in use-cases.ts
+
+```ts
+async listSupportedAgents(chatId: string): Promise<{
+  agents: readonly string[];
+  degraded?: { reason: string };
+}> {
+  if (!deps.adapter.listAgents) {
+    logger.warn("[agent-catalog] Adapter does not support listAgents — using FALLBACK_AGENTS");
+    return { agents: FALLBACK_AGENTS, degraded: { reason: "unsupported" } };
+  }
+
+  const catalog = await deps.adapter.listAgents({ chatId });
+  if (!catalog.ok) {
+    logger.warn("[agent-catalog] Adapter error — using FALLBACK_AGENTS", {
+      error: catalog.error.message,
+    });
+    return { agents: FALLBACK_AGENTS, degraded: { reason: "adapter-error" } };
+  }
+
+  if (!catalog.value.ok) {
+    logger.warn("[agent-catalog] Catalog degraded — using FALLBACK_AGENTS", {
+      reason: catalog.value.degraded?.reason ?? "unknown",
+      usingCache: catalog.value.degraded?.usingCache ?? false,
+    });
+    return { agents: FALLBACK_AGENTS, degraded: { reason: catalog.value.degraded?.reason ?? "unknown" } };
+  }
+
+  return { agents: catalog.value.agents.map((a) => a.id) };
+}
+```
+
+### 5.3 `setActiveAgent()` validation change
+
+After `isSupportedAgent()` check (or replacing it), fetch dynamic catalog:
+
+```ts
+// In setActiveAgent():
+const agent = normalizeAgentSelectionInput(input.agent);
+
+// Step 1: check fallback list (fast-path for common agents)
+if (!FALLBACK_AGENTS.includes(agent)) {
+  // Step 2: check dynamic catalog for unknown agents
+  const { agents, degraded } = await this.listSupportedAgents(input.chatId);
+  if (!agents.includes(agent)) {
+    return errResult(ERROR_CODES.VALIDATION_ERROR, "Agente no válido");
+  }
+}
+```
+
+Note: `FALLBACK_AGENTS` used as fast-path to avoid unnecessary network call for common agents. Full catalog check only for agents not in fallback list.
+
+### 5.4 Logger fallback calls
+
+Every fallback must call:
+```ts
+logger.warn("[agent-catalog] Fallback triggered: {reason} - using FALLBACK_AGENTS", {
+  reason: "timeout" | "unavailable" | "unsupported" | "unknown",
+  usingCache: boolean,
+});
+```
+
+## 6. Files to change
+
+| File | Change |
+|------|--------|
+| `src/domain/entities.ts` | `SUPPORTED_AGENTS` → `FALLBACK_AGENTS`. `SupportedAgent` → `string`. `isSupportedAgent()` logic. |
+| `src/application/contracts.ts` | Add `AgentCatalogItem`, `AgentCatalogResult`, `AgentCatalogDegradeReason`. Add `listAgents?()` to `OpenCodeSessionAdapter`. |
+| `src/application/use-cases.ts` | Rewrite `listSupportedAgents()` return signature and body. Update `setActiveAgent()` validation. Update `ApplicationUseCases` interface. |
+| `src/infrastructure/opencode-session-adapter.ts` | Add `listAgents()` to HTTP, CLI, PTY adapter classes. Add `AGENT_CATALOG_CACHE_TTL_MS`. Import `listAgents` from cli. |
+| `src/infrastructure/opencode-cli.ts` | Add `listAgents(timeoutMs)` function running `opencode agents`. Add `OpenCodeCliAgentItem` type. |
+| `src/infrastructure/opencode-tmux-host.ts` | (No changes needed — delegates to CLI) |
+| `src/adapters/telegram/router.ts` | Update `/agentes` and `/agente <x>` handlers for degraded banners. Update callback data types. |
+| `src/adapters/telegram/templates.ts` | Add `formatAgentCatalogDegraded()` (or inline in router). No signature changes needed. |
+| `mock/opencode-mock.ts` | Add `/opencode/agents` handler. |
+| `src/verification/rfc16-agent-selection.ts` | Update references from `SUPPORTED_AGENTS` to `FALLBACK_AGENTS`. |
+| `src/config.ts` | If referencing `SUPPORTED_AGENTS`, switch to literal `string` or `FALLBACK_AGENTS`. |
+
+## 7. Test Strategy
+
+- No formal test framework. Verification via `npm run start:local` with mock.
+- Manual test cases for each scenario in §2.
+- Verify `logger.warn()` output in console for degraded scenarios.
+- Verify mock extended agent list appears in `/agentes`.
+- Verify RFC-016 verification script still passes.
+- Verify `SUPPORTED_AGENTS.BUILD` references removed from codebase.

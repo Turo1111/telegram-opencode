@@ -36,3 +36,6 @@ Thumbs.db
 
 # AI agent artifacts
 .atl/
+
+# Mapa privado/local de la estructura del repo (no versionar)
+estructura-proyecto-completa.md

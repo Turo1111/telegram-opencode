@@ -193,6 +193,16 @@ process.on("unhandledRejection", (reason) => {
   logger.error("Unhandled rejection", { reason: String(reason) });
 });
 
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught exception", {
+    message: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined,
+  });
+});
+
+process.on("exit", (code) => {
+});
+
 if (require.main === module) {
   main().catch((err) => {
     logger.error("Fatal error", { message: err.message });

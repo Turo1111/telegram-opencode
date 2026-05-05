@@ -146,14 +146,17 @@ export function createOpenCodeCliMirrorService(deps: OpenCodeCliMirrorServiceDep
         continue;
       }
 
-      await (deps.sendTelegramTextFn ?? sendTelegramText)({
+        try {
+          await (deps.sendTelegramTextFn ?? sendTelegramText)({
         bot: deps.bot,
         chatId: numericChatId,
         text: message.text,
         contentKind: TELEGRAM_CONTENT_KIND.MODEL,
       });
 
-      const metadata = await resolveSessionMetadata(target, exported.messages);
+        } catch (sendErr) {
+        }
+        const metadata = await resolveSessionMetadata(target, exported.messages);
       const metadataNotice = formatExecutionMetadataBlock({
         effectiveAgent: metadata.agent,
         effectiveModel: metadata.model,
@@ -230,12 +233,24 @@ export function createOpenCodeCliMirrorService(deps: OpenCodeCliMirrorServiceDep
     return next;
   }
 
+  let sqliteWarningEmitted = false;
+
   async function loadSessionMessages(sessionId: string) {
     if (isLocalCliLikeMode(deps.config)) {
-      return (deps.readLocalSessionMessagesFn ?? readOpenCodeLocalSessionMessages)({
-        sessionId,
-        dbPath: deps.openCodeLocalDbPath,
-      });
+      try {
+        return await (deps.readLocalSessionMessagesFn ?? readOpenCodeLocalSessionMessages)({
+          sessionId,
+          dbPath: deps.openCodeLocalDbPath,
+        });
+      } catch (error) {
+        if (!sqliteWarningEmitted) {
+          sqliteWarningEmitted = true;
+          logger.error("Mirror: node:sqlite not available (requires Node.js >=22.5), mirror disabled", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return { sessionId, messages: [] };
+      }
     }
 
     return (deps.exportSessionFn ?? exportSession)({

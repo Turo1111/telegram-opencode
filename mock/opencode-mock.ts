@@ -109,6 +109,11 @@ const server = http.createServer((req, res) => {
         return;
       }
 
+      if (route === "/opencode/agents") {
+        handleListAgents(body, res);
+        return;
+      }
+
       writeJson(res, 404, { error: "Not found" });
     } catch (err) {
       writeJson(res, 400, { error: "Invalid JSON" });
@@ -474,6 +479,24 @@ function handleSessionObserve(body: Record<string, unknown>, res: http.ServerRes
     sessionId: validation.session.sessionId,
     projectId: validation.session.projectId,
     observedAt: new Date().toISOString(),
+  });
+}
+
+function handleListAgents(body: Record<string, unknown>, res: http.ServerResponse): void {
+  const fixture = resolveFixture(body);
+  if (fixture.matched) {
+    applyFixture(fixture.code, res, "listAgents");
+    return;
+  }
+
+  writeJson(res, 200, {
+    agents: [
+      { id: "build" },
+      { id: "plan" },
+      { id: "gentleman" },
+      { id: "sdd-orchestrator" },
+      { id: "sdd-orchestrator-frontend-cheap" },
+    ],
   });
 }
 

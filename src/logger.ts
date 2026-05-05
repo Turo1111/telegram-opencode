@@ -1,6 +1,6 @@
 import { SensitiveActionAuditEvent } from "./application/contracts";
 
-type Level = "info" | "error";
+type Level = "info" | "warn" | "error";
 
 export const LOCK_OUTCOME = {
   ACQUIRED_IMMEDIATE: "acquired-immediate",
@@ -30,6 +30,9 @@ function format(level: Level, message: string, meta?: Record<string, unknown>): 
 export const logger = {
   info(message: string, meta?: Record<string, unknown>) {
     console.log(format("info", message, meta));
+  },
+  warn(message: string, meta?: Record<string, unknown>) {
+    console.warn(format("warn", message, meta));
   },
   error(message: string, meta?: Record<string, unknown>) {
     console.error(format("error", message, meta));

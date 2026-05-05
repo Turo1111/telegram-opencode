@@ -758,7 +758,7 @@ function createFakeUseCasesForPolicy(): ApplicationUseCases & { __calls: { setAc
       };
     },
     async listSupportedAgents() {
-      return [SUPPORTED_AGENTS.BUILD, SUPPORTED_AGENTS.PLAN, SUPPORTED_AGENTS.GENTLEMAN, SUPPORTED_AGENTS.SDD_ORCHESTRATOR] as const;
+      return { agents: [SUPPORTED_AGENTS.BUILD, SUPPORTED_AGENTS.PLAN, SUPPORTED_AGENTS.GENTLEMAN, SUPPORTED_AGENTS.SDD_ORCHESTRATOR] as readonly string[] };
     },
     async getActiveAgent() {
       return { ok: true, value: SUPPORTED_AGENTS.BUILD };
@@ -814,7 +814,7 @@ function createFakeUseCasesForAgentCommandRuntime(input: {
       };
     },
     async listSupportedAgents() {
-      return [SUPPORTED_AGENTS.BUILD, SUPPORTED_AGENTS.PLAN, SUPPORTED_AGENTS.GENTLEMAN, SUPPORTED_AGENTS.SDD_ORCHESTRATOR] as const;
+      return { agents: [SUPPORTED_AGENTS.BUILD, SUPPORTED_AGENTS.PLAN, SUPPORTED_AGENTS.GENTLEMAN, SUPPORTED_AGENTS.SDD_ORCHESTRATOR] as readonly string[] };
     },
     async getActiveAgent() {
       calls.getActiveAgent += 1;

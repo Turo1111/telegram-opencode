@@ -115,14 +115,17 @@ export interface PendingPrompt {
   updatedAt: string;
 }
 
+export const FALLBACK_AGENTS = ["build", "plan", "gentleman", "sdd-orchestrator"] as const;
+
+export type SupportedAgent = string;
+
+/** @deprecated Use FALLBACK_AGENTS instead */
 export const SUPPORTED_AGENTS = {
   BUILD: "build",
   PLAN: "plan",
   GENTLEMAN: "gentleman",
   SDD_ORCHESTRATOR: "sdd-orchestrator",
 } as const;
-
-export type SupportedAgent = (typeof SUPPORTED_AGENTS)[keyof typeof SUPPORTED_AGENTS];
 
 export interface AgentSelection {
   chatId: string;
@@ -139,7 +142,7 @@ export interface ModelSelection {
 }
 
 export function isSupportedAgent(value: string): value is SupportedAgent {
-  return Object.values(SUPPORTED_AGENTS).includes(value as SupportedAgent);
+  return (FALLBACK_AGENTS as readonly string[]).includes(value);
 }
 
 export const DANGEROUS_ACTION_CONFIRMATION_STATUS = {

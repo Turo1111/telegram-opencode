@@ -58,7 +58,7 @@ export async function ensureHostSession(input: EnsureTmuxHostSessionInput): Prom
   const knownAgent = hostAgentBySessionName.get(sessionName);
   const knownModel = hostModelBySessionName.get(sessionName);
   const agentNeedsReconfigure = Boolean(input.agent) && knownAgent !== input.agent;
-  const modelNeedsReconfigure = Boolean(input.model) && knownModel !== input.model;
+  const modelNeedsReconfigure = Boolean(input.model) && knownModel !== undefined && knownModel !== input.model;
 
   if (exists && !agentNeedsReconfigure && !modelNeedsReconfigure) {
     if (input.agent && knownAgent === undefined) {
@@ -156,10 +156,14 @@ export async function sendInput(input: SendTmuxInputInput): Promise<void> {
     );
   }
 
-  await runTmux({
-    args: ["send-keys", "-t", `${sessionName}:0.0`, "--", input.input, "Enter"],
-    timeoutMs: input.timeoutMs,
-  });
+  try {
+    await runTmux({
+      args: ["send-keys", "-t", `${sessionName}:0.0`, "--", input.input, "Enter"],
+      timeoutMs: input.timeoutMs,
+    });
+  } catch (error) {
+    throw error;
+  }
 }
 
 export async function interrupt(input: InterruptTmuxInput): Promise<void> {
@@ -259,6 +263,9 @@ function sleep(ms: number): Promise<void> {
 async function runTmux(input: { readonly args: readonly string[]; readonly timeoutMs: number }): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile("tmux", input.args, { timeout: input.timeoutMs }, (error, stdout, stderr) => {
+      if (error) {
+      } else {
+      }
       if (!error) {
         resolve(stdout.trim());
         return;

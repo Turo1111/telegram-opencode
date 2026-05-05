@@ -39,7 +39,7 @@ import {
   PendingPrompt,
   Project,
   Session,
-  SUPPORTED_AGENTS,
+  FALLBACK_AGENTS,
   SupportedAgent,
   isSupportedAgent,
   applyProjectSelection,
@@ -216,7 +216,10 @@ export interface ApplicationUseCases {
   cancelSession(input: CancelSessionInput): Promise<Result<CancelSessionOutput>>;
   getStatus(chatId: string): Promise<Result<StatusOutput>>;
   refreshSessionMetadata?(chatId: string): Promise<Result<SessionMetadataSyncOutput>>;
-  listSupportedAgents?(): Promise<readonly SupportedAgent[]>;
+  listSupportedAgents?(chatId: string): Promise<{
+    agents: readonly string[];
+    degraded?: { reason: string };
+  }>;
   getActiveAgent?(chatId: string): Promise<Result<SupportedAgent>>;
   setActiveAgent?(input: { chatId: string; agent: string }): Promise<Result<SetActiveAgentOutput>>;
   listAvailableModels?(chatId: string): Promise<Result<{ activeModel?: string; models: readonly string[]; degraded?: string }>>;
@@ -322,14 +325,52 @@ export function createApplicationUseCases(
     ? new Set(deps.localHostOptions.allowedActorIds)
     : undefined;
 
+const HIDDEN_AGENT_WORDS = [
+  "compaction", "explore", "general", "summary", "title",
+  "apply", "archive", "design", "init", "onboard",
+  "propose", "spec", "tasks", "verify",
+];
+
+function shouldShowAgent(agentId: string): boolean {
+  return !HIDDEN_AGENT_WORDS.some((word) => agentId.includes(word));
+}
+
   return {
-    async listSupportedAgents() {
-      return [
-        SUPPORTED_AGENTS.BUILD,
-        SUPPORTED_AGENTS.PLAN,
-        SUPPORTED_AGENTS.GENTLEMAN,
-        SUPPORTED_AGENTS.SDD_ORCHESTRATOR,
-      ] as const;
+    async listSupportedAgents(chatId: string) {
+      const adapter = deps.adapter;
+
+      if (!adapter.listAgents) {
+        logger.warn("[agent-catalog] Adapter does not support listAgents — using FALLBACK_AGENTS");
+        return { agents: FALLBACK_AGENTS as readonly string[], degraded: { reason: "unsupported" } };
+      }
+
+      const catalog = await adapter.listAgents({ chatId, projectId: "", sessionId: undefined });
+      if (!catalog.ok) {
+        logger.warn("[agent-catalog] Adapter error — using FALLBACK_AGENTS", {
+          error: catalog.error.message,
+        });
+        return { agents: FALLBACK_AGENTS as readonly string[], degraded: { reason: "adapter-error" } };
+      }
+
+      if (!catalog.value.ok) {
+        logger.warn("[agent-catalog] Catalog degraded — using FALLBACK_AGENTS", {
+          reason: catalog.value.degraded?.reason ?? "unknown",
+          usingCache: catalog.value.degraded?.usingCache ?? false,
+        });
+        return {
+          agents: FALLBACK_AGENTS as readonly string[],
+          degraded: { reason: catalog.value.degraded?.reason ?? "unknown" },
+        };
+      }
+
+      const raw = catalog.value.agents.map((a) => a.id);
+      const agents = raw.filter(shouldShowAgent);
+
+      logger.info("[agent-catalog] Dynamic catalog loaded", {
+        raw: raw.length,
+        filtered: agents.length,
+      });
+      return { agents };
     },
 
     async getActiveAgent(chatId) {
@@ -351,7 +392,19 @@ export function createApplicationUseCases(
     async setActiveAgent(input) {
       const agent = normalizeAgentSelectionInput(input.agent);
       if (!isSupportedAgent(agent)) {
-        return errResult(ERROR_CODES.VALIDATION_ERROR, "Agente no válido");
+        // Not in fallback — check dynamic catalog
+        if (deps.adapter.listAgents) {
+          const catalog = await deps.adapter.listAgents({ chatId: input.chatId, projectId: "", sessionId: undefined });
+          if (!catalog.ok || !catalog.value.ok) {
+            return errResult(ERROR_CODES.VALIDATION_ERROR, "Agente no válido");
+          }
+          const agentIds = catalog.value.agents.map((a) => a.id);
+          if (!agentIds.includes(agent)) {
+            return errResult(ERROR_CODES.VALIDATION_ERROR, "Agente no válido");
+          }
+        } else {
+          return errResult(ERROR_CODES.VALIDATION_ERROR, "Agente no válido");
+        }
       }
 
       const nowIso = new Date().toISOString();
@@ -2251,11 +2304,11 @@ async function resolveEffectiveAgent(
     return unit.agentSelections.findByChatAndProject(chatId, projectId);
   });
 
-  if (selection?.activeAgent && isSupportedAgent(selection.activeAgent)) {
+  if (selection?.activeAgent) {
     return selection.activeAgent;
   }
 
-  return configuredDefaultAgent ?? SUPPORTED_AGENTS.BUILD;
+  return configuredDefaultAgent ?? FALLBACK_AGENTS[0];
 }
 
 async function resolveEffectiveModel(

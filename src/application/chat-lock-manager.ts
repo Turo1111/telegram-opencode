@@ -1,3 +1,5 @@
+import { logger } from "../logger";
+
 interface ChatLockQueueEntry {
   readonly run: () => Promise<void>;
 }
@@ -73,7 +75,11 @@ function release(states: Map<string, ChatLockState>, chatId: string): void {
   const next = state.queue.shift();
   if (next) {
     state.active = true;
-    void next.run();
+    void next.run().catch((err) => {
+      logger.error("Chat lock queue item failed", {
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
     return;
   }
 

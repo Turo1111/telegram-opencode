@@ -952,7 +952,7 @@ ${formatProjectSessionsEmptyDebug({ activeRootPath: activeProject.rootPath, insp
         await send(formatUnknownError());
         return;
       }
-      const list = await deps.useCases.listSupportedAgents();
+      const catalog = await deps.useCases.listSupportedAgents(commandContext.chatId);
       if (!deps.useCases.getActiveAgent) {
         await send(formatUnknownError());
         return;
@@ -964,14 +964,19 @@ ${formatProjectSessionsEmptyDebug({ activeRootPath: activeProject.rootPath, insp
         return;
       }
 
+      let message = formatAgentList(catalog.agents, active.value);
+      if (catalog.degraded) {
+        message = `⚠️ Catálogo remoto de agentes no disponible (${catalog.degraded.reason}). Mostrando lista por defecto.\n\n${message}`;
+      }
+
       const keyboard = buildAgentSelectionKeyboard({
-        agents: list,
+        agents: catalog.agents,
         chatId: commandContext.chatId,
         projectId: statusResult.value.projectId ?? "",
         agentSelectionTokens,
       });
 
-      await deps.bot.sendMessage(numericChatId, formatAgentList(list, active.value), {
+      await deps.bot.sendMessage(numericChatId, message, {
         reply_markup: keyboard,
       });
       return;
@@ -1052,7 +1057,12 @@ ${formatProjectSessionsEmptyDebug({ activeRootPath: activeProject.rootPath, insp
       const set = await deps.useCases.setActiveAgent({ chatId: commandContext.chatId, agent: intent.args });
       if (!set.ok) {
         if (set.error.code === "VALIDATION_ERROR" && set.error.message === "Agente no válido") {
-          await send(formatInvalidAgent(await deps.useCases.listSupportedAgents()));
+          const catalog = await deps.useCases.listSupportedAgents(commandContext.chatId);
+          let msg = formatInvalidAgent(catalog.agents);
+          if (catalog.degraded) {
+            msg = `⚠️ Catálogo remoto no disponible. Usando lista por defecto. Si ves un error inesperado, reintentá.\n\n${msg}`;
+          }
+          await send(msg);
           return;
         }
         await send(formatDomainError(set.error));

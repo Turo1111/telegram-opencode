@@ -14,12 +14,17 @@ and this project adheres to Semantic Versioning.
 - RFC-017: Selección de modelo OpenCode desde Telegram con comandos `/modelos`, `/modelo`, `/modelo <id>`, catálogo dinámico por adapter, persistencia `activeModel` por chat+proyecto, propagación en ejecución y fallback/degradación explícitos.
 - RFC-018: Notificación terminal en Telegram con agente/modelo efectivos, reporte explícito de drift requested→effective (fallback/override) y manejo seguro cuando metadata efectiva no está disponible.
 - RFC-019: Hardening de `/sesion` como alias de `/sesiones`, verificación de paginación determinística (máximo 5 por página + callbacks `sesspg:<page>` + límites) y gate de cierre documental por token exacto en changelog.
+- RFC-020: Catálogo dinámico de agentes desde OpenCode. Reemplazado SUPPORTED_AGENTS singleton por catálogo consultado a OpenCode con caché TTL 30s, fallback a FALLBACK_AGENTS hardcodeado, notificación doble canal (Telegram ⚠️ + logger.warn), validación dinámica en /agente. Implementado en HTTP, CLI y PTY adapters. Mock extendido con /opencode/agents.
 
 ### Changed
 - RFC-015: Establecido proceso obligatorio de cierre RFC con actualización de `CHANGELOG.md` versionado (Keep a Changelog + SemVer) y referencia cruzada RFC.
 
 ### Fixed
-- Sin cambios.
+- WSL console crash when sending Telegram message (fix-close-wsl)
+  - Added uncaughtException handler to prevent process exit on sync throws
+  - Added .catch() to fire-and-forget promise chains
+  - Added stderr diagnostics in start-local.js with 500ms shutdown delay
+  - Added graceful node:sqlite fallback with once-only logging in mirror service
 
 ### Security
 - RFC-012: Endurecida automatización local desde Telegram: `private-only`, flags apagadas por defecto, confirmación de 2 pasos, fail-closed y auditoría obligatoria.

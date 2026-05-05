@@ -4,7 +4,7 @@ import {
   OpenCodeAdapterMode,
   parseOpenCodeAdapterMode,
 } from "./infrastructure/opencode-adapter-mode";
-import { isSupportedAgent, SUPPORTED_AGENTS, SupportedAgent } from "./domain/entities";
+import { FALLBACK_AGENTS, isSupportedAgent, SupportedAgent } from "./domain/entities";
 
 dotenv.config();
 
@@ -47,11 +47,11 @@ export interface Config {
 function parseDefaultAgent(): SupportedAgent {
   const raw = (process.env.OPEN_CODE_DEFAULT_AGENT || "").trim();
   if (!raw) {
-    return SUPPORTED_AGENTS.BUILD;
+    return FALLBACK_AGENTS[0];
   }
 
   if (!isSupportedAgent(raw)) {
-    return SUPPORTED_AGENTS.BUILD;
+    return FALLBACK_AGENTS[0];
   }
 
   return raw;

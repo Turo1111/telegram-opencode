@@ -370,6 +370,24 @@ export interface ModelCatalogResult {
   };
 }
 
+export const AGENT_CATALOG_DEGRADE_REASON = MODEL_CATALOG_DEGRADE_REASON;
+export type AgentCatalogDegradeReason = (typeof AGENT_CATALOG_DEGRADE_REASON)[keyof typeof AGENT_CATALOG_DEGRADE_REASON];
+
+export interface AgentCatalogItem {
+  readonly id: string;
+  readonly label?: string;
+}
+
+export interface AgentCatalogResult {
+  readonly ok: boolean;
+  readonly agents: readonly AgentCatalogItem[];
+  readonly fetchedAt: string;
+  readonly degraded?: {
+    readonly reason: AgentCatalogDegradeReason;
+    readonly usingCache: boolean;
+  };
+}
+
 export interface ModelSelectionRepository {
   findByChatAndProject(chatId: string, projectId: string): Promise<ModelSelection | undefined>;
   upsert(selection: ModelSelection): Promise<void>;
@@ -481,6 +499,11 @@ export interface OpenCodeSessionAdapter {
     agent: SupportedAgent;
   }): Promise<Result<{ projectId: string; sessionId: string; agent: SupportedAgent }>>;
   listModels?(input: { projectId: string; sessionId?: string; chatId: string }): Promise<Result<ModelCatalogResult>>;
+  listAgents?(input: {
+    projectId: string;
+    sessionId?: string;
+    chatId: string;
+  }): Promise<Result<AgentCatalogResult>>;
   configureSessionModel?(input: {
     projectId: string;
     sessionId: string;

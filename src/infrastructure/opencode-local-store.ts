@@ -202,7 +202,15 @@ function extractMeaningfulPartText(rawPartData: string | null): string | undefin
 
 async function resolveDatabaseCtor(): Promise<new (filePath: string) => SqliteDatabase> {
   const moduleName = "node:sqlite";
-  const sqliteModule = (await import(moduleName)) as SqliteModuleShape;
+  let sqliteModule: SqliteModuleShape;
+  try {
+    sqliteModule = (await import(moduleName)) as SqliteModuleShape;
+  } catch (err) {
+    throw new Error(
+      "node:sqlite module not available (requires Node.js >=22.5). " +
+      "Mirror service disabled. Error: " + (err instanceof Error ? err.message : String(err))
+    );
+  }
   const ctor = sqliteModule.DatabaseSync ?? sqliteModule.default?.DatabaseSync ?? sqliteModule.sqlite3?.DatabaseSync;
 
   if (!ctor) {

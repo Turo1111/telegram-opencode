@@ -24,6 +24,11 @@ export interface OpenCodeCliModelItem {
   readonly id: string;
   readonly label?: string;
 }
+
+export interface OpenCodeCliAgentItem {
+  readonly id: string;
+  readonly label?: string;
+}
 export interface OpenCodeCliMessage {
   readonly id: string;
   readonly role: OpenCodeCliRole;
@@ -132,6 +137,68 @@ export async function listModels(timeoutMs: number): Promise<readonly OpenCodeCl
   });
 
   return parseOpenCodeCliModelList(result.stdout);
+}
+
+export async function listCliAgents(timeoutMs: number): Promise<readonly OpenCodeCliAgentItem[]> {
+  try {
+    const result = await runOpenCodeCli({
+      args: ["agent", "list"],
+      timeoutMs,
+    });
+    return parseOpenCodeCliAgentList(result.stdout);
+  } catch (error) {
+    if (error instanceof OpenCodeCliError && error.kind === "not-installed") {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export function parseOpenCodeCliAgentList(raw: string): readonly OpenCodeCliAgentItem[] {
+  const itemsFromJson = tryParseAgentListJson(raw);
+  if (itemsFromJson.length > 0) {
+    return itemsFromJson;
+  }
+
+  const lines = raw.split(/\r?\n/u);
+  const result: OpenCodeCliAgentItem[] = [];
+
+  for (const line of lines) {
+    // Agent lines start at column 0 and are NOT just "]" or starting with "["
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (line.startsWith(" ") || line.startsWith("\t")) continue;
+    if (trimmed === "]" || trimmed.startsWith("[") || trimmed.startsWith('"')) continue;
+
+    // Format: "agent_name (role)" or "agent_name"
+    const match = trimmed.match(/^(\S+)(?:\s*\(([^)]+)\))?/);
+    if (!match) continue;
+    result.push({ id: match[1]!, label: match[2] });
+  }
+
+  return result;
+}
+
+function tryParseAgentListJson(raw: string): readonly OpenCodeCliAgentItem[] {
+  try {
+    const parsed = parseJson(raw, "agents");
+    const rawItems = Array.isArray(parsed)
+      ? parsed
+      : isRecord(parsed) && Array.isArray(parsed.agents)
+        ? parsed.agents
+        : [];
+
+    const items: OpenCodeCliAgentItem[] = [];
+    for (const item of rawItems) {
+      if (!isRecord(item)) continue;
+      const id = readString(item.id);
+      if (!id) continue;
+      items.push({ id, label: readString(item.label) ?? readString(item.title) });
+    }
+    return items;
+  } catch {
+    return [];
+  }
 }
 
 export async function runSessionMessage(input: {

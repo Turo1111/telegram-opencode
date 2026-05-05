@@ -30,6 +30,7 @@ import {
   resolveCanonicalProjectPath,
   runSessionMessage,
   startSessionMessage,
+  listCliAgents,
   listModels as listCliModels,
 } from "./opencode-cli";
 import { OPEN_CODE_ADAPTER_MODE } from "./opencode-adapter-mode";
@@ -120,8 +121,46 @@ function resolveCatalogFromCacheOnFailure(
   return { ok: true, models: cached.models, fetchedAt: cached.fetchedAt, degraded: { reason, usingCache: true } };
 }
 
+const AGENT_CATALOG_CACHE_TTL_MS = 30_000;
+
+interface AgentCatalogCacheEntry {
+  readonly agents: ReadonlyArray<{ id: string; label?: string }>;
+  readonly fetchedAt: string;
+  readonly expiresAtMs: number;
+}
+
+function cacheAgentCatalog(
+  cache: Map<string, AgentCatalogCacheEntry>,
+  key: string,
+  agents: ReadonlyArray<{ id: string; label?: string }>,
+  nowIso: string
+): AgentCatalogCacheEntry {
+  const entry: AgentCatalogCacheEntry = {
+    agents,
+    fetchedAt: nowIso,
+    expiresAtMs: Date.now() + AGENT_CATALOG_CACHE_TTL_MS,
+  };
+  cache.set(key, entry);
+  return entry;
+}
+
+function resolveAgentCatalogFromCacheOnFailure(
+  cache: Map<string, AgentCatalogCacheEntry>,
+  key: string,
+  reason: "timeout" | "unavailable" | "unsupported" | "upstream"
+): import("../application/contracts").AgentCatalogResult {
+  const nowIso = new Date().toISOString();
+  const cached = cache.get(key);
+  if (!cached) {
+    return { ok: false, agents: [], fetchedAt: nowIso, degraded: { reason, usingCache: false } };
+  }
+  const fresh = cached.expiresAtMs > Date.now();
+  return { ok: true, agents: cached.agents, fetchedAt: cached.fetchedAt, degraded: { reason, usingCache: !!fresh } };
+}
+
 export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
   private readonly modelCatalogCache = new Map<string, ModelCatalogCacheEntry>();
+  private readonly agentCatalogCache = new Map<string, AgentCatalogCacheEntry>();
 
   constructor(private readonly client: OpenCodeHttpClient) {}
 
@@ -366,6 +405,54 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     }
   }
 
+  async listAgents(input: {
+    projectId: string;
+    sessionId?: string;
+    chatId: string;
+  }): Promise<Result<import("../application/contracts").AgentCatalogResult>> {
+    const key = catalogCacheKey(input);
+    try {
+      const payload: { agents?: Array<{ id?: string; label?: string }> } = await this.client.post({
+        endpoint: "/opencode/agents",
+        operationName: "listAgents",
+        operationKind: OPEN_CODE_OPERATION_KINDS.CONTROL,
+        payload: { projectId: input.projectId, sessionId: input.sessionId, chatId: input.chatId },
+      });
+      const raw = payload.agents ?? [];
+      const agents = raw.filter((a) => typeof a.id === "string" && a.id.trim()).map((a) => ({
+        id: String(a.id),
+        label: typeof a.label === "string" ? a.label : undefined,
+      }));
+      const nowIso = new Date().toISOString();
+      cacheAgentCatalog(this.agentCatalogCache, key, agents, nowIso);
+      return ok({ ok: true, agents, fetchedAt: nowIso });
+    } catch (error) {
+      const mapped = mapOpenCodeError(error, "listAgents");
+      if (mapped.code === ADAPTER_ERROR_CODES.UNSUPPORTED) {
+        // Try CLI fallback when HTTP endpoint doesn't exist
+        try {
+          const items = await listCliAgents(5000);
+          if (items.length > 0) {
+            const agents = items.map((a) => ({ id: a.id, label: a.label }));
+            const nowIso = new Date().toISOString();
+            cacheAgentCatalog(this.agentCatalogCache, key, agents, nowIso);
+            return ok({ ok: true, agents, fetchedAt: nowIso });
+          }
+        } catch {
+          // CLI fallback also failed, use cache
+        }
+        return ok(resolveAgentCatalogFromCacheOnFailure(this.agentCatalogCache, key, "unsupported"));
+      }
+      if (mapped.code === ADAPTER_ERROR_CODES.UNAVAILABLE || mapped.code === ADAPTER_ERROR_CODES.TIMEOUT) {
+        return ok(resolveAgentCatalogFromCacheOnFailure(
+          this.agentCatalogCache, key,
+          mapped.code === ADAPTER_ERROR_CODES.TIMEOUT ? "timeout" : "unavailable"
+        ));
+      }
+      return err(mapAdapterResultError(mapped));
+    }
+  }
+
   async getSessionState(input: {
     projectId: string;
     sessionId: string;
@@ -495,6 +582,7 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
 export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
   private readonly projectDirById = new Map<string, string>();
   private readonly modelCatalogCache = new Map<string, ModelCatalogCacheEntry>();
+  private readonly agentCatalogCache = new Map<string, AgentCatalogCacheEntry>();
 
   constructor(
     private readonly config: Config,
@@ -504,12 +592,14 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       readonly runSessionMessage: typeof runSessionMessage;
       readonly startSessionMessage: typeof startSessionMessage;
       readonly listModels?: typeof listCliModels;
+      readonly listAgents?: typeof listCliAgents;
     } = {
       listSessions,
       resolveCanonicalProjectPath,
       runSessionMessage,
       startSessionMessage,
       listModels: listCliModels,
+      listAgents: listCliAgents,
     }
   ) {}
 
@@ -675,6 +765,30 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     }
   }
 
+  async listAgents(input: {
+    projectId: string;
+    sessionId?: string;
+    chatId: string;
+  }): Promise<Result<import("../application/contracts").AgentCatalogResult>> {
+    const key = catalogCacheKey(input);
+    try {
+      const items = await (this.cliOps.listAgents ?? listCliAgents)(this.config.openCodeControlTimeoutMs);
+      const agents = items.map((a) => ({ id: a.id, label: a.label }));
+      if (agents.length === 0) {
+        return ok(resolveAgentCatalogFromCacheOnFailure(this.agentCatalogCache, key, "unsupported"));
+      }
+      const nowIso = new Date().toISOString();
+      cacheAgentCatalog(this.agentCatalogCache, key, agents, nowIso);
+      return ok({ ok: true, agents, fetchedAt: nowIso });
+    } catch (error) {
+      const mapped = mapCliError(error, "listAgents");
+      if (mapped.code === ADAPTER_ERROR_CODES.TIMEOUT || mapped.code === ADAPTER_ERROR_CODES.UNAVAILABLE) {
+        return ok(resolveAgentCatalogFromCacheOnFailure(this.agentCatalogCache, key, mapped.code === ADAPTER_ERROR_CODES.TIMEOUT ? "timeout" : "unavailable"));
+      }
+      return err(mapAdapterResultError(mapped));
+    }
+  }
+
   async getSessionState(input: {
     projectId: string;
     sessionId: string;
@@ -800,6 +914,7 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
   private readonly configuredAgentBySessionId = new Map<string, SupportedAgent>();
   private readonly configuredModelBySessionId = new Map<string, string>();
   private readonly modelCatalogCache = new Map<string, ModelCatalogCacheEntry>();
+  private readonly agentCatalogCache = new Map<string, AgentCatalogCacheEntry>();
 
   constructor(
     private readonly config: Config,
@@ -1011,6 +1126,30 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       return ok({ ok: true, models: out, fetchedAt: nowIso });
     } catch {
       return ok(resolveCatalogFromCacheOnFailure(this.modelCatalogCache, key, "unavailable"));
+    }
+  }
+
+  async listAgents(input: {
+    projectId: string;
+    sessionId?: string;
+    chatId: string;
+  }): Promise<Result<import("../application/contracts").AgentCatalogResult>> {
+    const key = `pty:${catalogCacheKey(input)}`;
+    try {
+      const items = await listCliAgents(this.config.openCodeControlTimeoutMs);
+      const agents = items.map((a) => ({ id: a.id, label: a.label }));
+      if (agents.length === 0) {
+        return ok(resolveAgentCatalogFromCacheOnFailure(this.agentCatalogCache, key, "unsupported"));
+      }
+      const nowIso = new Date().toISOString();
+      cacheAgentCatalog(this.agentCatalogCache, key, agents, nowIso);
+      return ok({ ok: true, agents, fetchedAt: nowIso });
+    } catch (error) {
+      const mapped = mapPtyError(error, "listAgents");
+      if (mapped.code === ADAPTER_ERROR_CODES.TIMEOUT || mapped.code === ADAPTER_ERROR_CODES.UNAVAILABLE) {
+        return ok(resolveAgentCatalogFromCacheOnFailure(this.agentCatalogCache, key, mapped.code === ADAPTER_ERROR_CODES.TIMEOUT ? "timeout" : "unavailable"));
+      }
+      return err(mapAdapterResultError(mapped));
     }
   }
 
