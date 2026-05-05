@@ -44,6 +44,17 @@ import {
   formatNewSessionToolingUnavailable,
   formatNewSessionUnsupportedBackend,
   formatDomainError,
+  formatExecutionMetadataBlock,
+  formatAgentActive,
+  formatAgentActiveWithSessionReconfigured,
+  formatAgentSyncNotice,
+  formatAgentList,
+  formatInvalidAgent,
+  formatInvalidModel,
+  formatModelActive,
+  formatModelActiveWithSessionReconfigured,
+  formatModelList,
+  formatModelUnavailable,
   formatFreeTextRejectedBusy,
   formatNoSessionGuide,
   formatProjectQuery,
@@ -52,8 +63,10 @@ import {
   formatProjectSessionMismatch,
   formatProjectSessions,
   formatProjectSessionsEmpty,
+  formatProjectSessionsEmptyDebug,
   formatProjectSessionsReadError,
   formatProjectSessionsRequireProject,
+  formatSesionTypoGuidance,
   formatProjectSessionUnavailable,
   formatProjectSelected,
   formatSendSuccess,
@@ -80,6 +93,7 @@ import {
   inspectProjectSessions,
   PROJECT_SESSION_ASSOCIATION,
   PROJECT_SESSION_INSPECTION_RESULT_KIND,
+  ProjectSessionListItem,
   selectSafeProjectSessions,
 } from "../../infrastructure/opencode-project-sessions";
 import { toTmuxSessionName } from "../../infrastructure/opencode-tmux-host";
@@ -96,6 +110,7 @@ export interface TelegramRouterDeps {
   localHostActionsEnabled?: boolean;
   attachLocalEnabled?: boolean;
   localHostConfirmationTtlMs?: number;
+  sesionAliasEnabled?: boolean;
 }
 
 const CLI_CANCEL_UNSUPPORTED_GUIDANCE =
@@ -131,6 +146,11 @@ export const TELEGRAM_COMMAND_INTENT_KIND = {
   SESSIONS: "sessions",
   PROJECT: "project",
   SESSION: "session",
+  AGENT: "agent",
+  AGENTS: "agents",
+  AGENT_SYNC: "agent-sync",
+  MODEL: "model",
+  MODELS: "models",
   NEW: "new",
   CANCEL: "cancel",
   ATTACH_LOCAL: "attach-local",
@@ -177,6 +197,11 @@ const COMMAND_INTENT_POLICY = {
   [TELEGRAM_COMMAND_INTENT_KIND.SESSIONS]: COMMAND_POLICY.READ_ONLY,
   [TELEGRAM_COMMAND_INTENT_KIND.CANCEL]: COMMAND_POLICY.READ_ONLY,
   [TELEGRAM_COMMAND_INTENT_KIND.PROJECT]: COMMAND_POLICY.READ_ONLY,
+  [TELEGRAM_COMMAND_INTENT_KIND.AGENT]: COMMAND_POLICY.READ_ONLY,
+  [TELEGRAM_COMMAND_INTENT_KIND.AGENTS]: COMMAND_POLICY.READ_ONLY,
+  [TELEGRAM_COMMAND_INTENT_KIND.AGENT_SYNC]: COMMAND_POLICY.READ_ONLY,
+  [TELEGRAM_COMMAND_INTENT_KIND.MODEL]: COMMAND_POLICY.READ_ONLY,
+  [TELEGRAM_COMMAND_INTENT_KIND.MODELS]: COMMAND_POLICY.READ_ONLY,
   [TELEGRAM_COMMAND_INTENT_KIND.SESSION]: COMMAND_POLICY.EXECUTION,
   [TELEGRAM_COMMAND_INTENT_KIND.NEW]: COMMAND_POLICY.EXECUTION,
   [TELEGRAM_COMMAND_INTENT_KIND.ATTACH_LOCAL]: COMMAND_POLICY.LOCAL_HOST_DANGEROUS,
@@ -191,9 +216,15 @@ const COMMAND_ALIASES = {
   status: TELEGRAM_COMMAND_INTENT_KIND.STATUS,
   st: TELEGRAM_COMMAND_INTENT_KIND.STATUS,
   sesiones: TELEGRAM_COMMAND_INTENT_KIND.SESSIONS,
+  sesion: TELEGRAM_COMMAND_INTENT_KIND.SESSIONS,
   project: TELEGRAM_COMMAND_INTENT_KIND.PROJECT,
   p: TELEGRAM_COMMAND_INTENT_KIND.PROJECT,
   session: TELEGRAM_COMMAND_INTENT_KIND.SESSION,
+  agente: TELEGRAM_COMMAND_INTENT_KIND.AGENT,
+  agentes: TELEGRAM_COMMAND_INTENT_KIND.AGENTS,
+  "agent-sync": TELEGRAM_COMMAND_INTENT_KIND.AGENT_SYNC,
+  modelo: TELEGRAM_COMMAND_INTENT_KIND.MODEL,
+  modelos: TELEGRAM_COMMAND_INTENT_KIND.MODELS,
   s: TELEGRAM_COMMAND_INTENT_KIND.SESSION,
   new: TELEGRAM_COMMAND_INTENT_KIND.NEW,
   n: TELEGRAM_COMMAND_INTENT_KIND.NEW,
@@ -211,6 +242,11 @@ const BASE_COMMAND_CATALOG = [
   "/project | /p <alias|projectId>",
   "/session | /s <sessionId>",
   "/cancel | /c",
+  "/agentes",
+  "/agente | /agente <nombre>",
+  "/agent-sync",
+  "/modelos",
+  "/modelo | /modelo <id>",
 ] as const;
 
 const DANGEROUS_COMMAND_CATALOG = [
@@ -219,11 +255,20 @@ const DANGEROUS_COMMAND_CATALOG = [
 
 const DEFAULT_OPEN_CODE_CONTROL_TIMEOUT_MS = 5_000;
 const SESSION_SELECTION_CALLBACK_PREFIX = "sess";
+const SESSION_PAGE_CALLBACK_PREFIX = "sesspg";
 const DANGEROUS_ACTION_CALLBACK_PREFIX = "dha";
+const MODEL_SELECTION_CALLBACK_PREFIX = "mod";
+const AGENT_SELECTION_CALLBACK_PREFIX = "agt";
 const SESSION_SELECTION_CALLBACK_ACTION = {
   SELECT: "sel",
   CONFIRM: "ok",
   CANCEL: "no",
+} as const;
+const MODEL_SELECTION_CALLBACK_ACTION = {
+  SELECT: "sel",
+} as const;
+const AGENT_SELECTION_CALLBACK_ACTION = {
+  SELECT: "sel",
 } as const;
 
 const SESSION_SELECTION_TOKEN_ORIGIN = {
@@ -250,9 +295,23 @@ interface SessionSelectionCallbackPayload {
   readonly token: string;
 }
 
+interface SessionPageCallbackPayload {
+  readonly page: number;
+}
+
 interface DangerousActionCallbackPayload {
   readonly action: DangerousActionCallbackAction;
   readonly confirmationId: string;
+}
+
+interface ModelSelectionCallbackPayload {
+  readonly action: (typeof MODEL_SELECTION_CALLBACK_ACTION)[keyof typeof MODEL_SELECTION_CALLBACK_ACTION];
+  readonly token: string;
+}
+
+interface AgentSelectionCallbackPayload {
+  readonly action: (typeof AGENT_SELECTION_CALLBACK_ACTION)[keyof typeof AGENT_SELECTION_CALLBACK_ACTION];
+  readonly token: string;
 }
 
 interface SessionSelectionTokenRecord {
@@ -264,12 +323,49 @@ interface SessionSelectionTokenRecord {
   readonly createdAt: number;
 }
 
+interface ModelSelectionTokenRecord {
+  readonly chatId: string;
+  readonly projectId: string;
+  readonly group: string;
+  readonly model: string;
+  readonly createdAt: number;
+}
+
+interface AgentSelectionTokenRecord {
+  readonly chatId: string;
+  readonly projectId: string;
+  readonly group: string;
+  readonly agent: string;
+  readonly createdAt: number;
+}
+
+interface ModelCatalogGroupItem {
+  readonly group: string;
+  readonly label: string;
+}
+
+const MODEL_CATALOG_GROUPS = {
+  OPENCODE: "opencode",
+  OPENAI: "openai",
+  GITHUB_COPILOT: "github-copilot",
+} as const;
+
+type ModelCatalogGroup = (typeof MODEL_CATALOG_GROUPS)[keyof typeof MODEL_CATALOG_GROUPS];
+
+const MODEL_CATALOG_GROUP_ITEMS: readonly ModelCatalogGroupItem[] = [
+  { group: MODEL_CATALOG_GROUPS.OPENCODE, label: "OpenCode" },
+  { group: MODEL_CATALOG_GROUPS.OPENAI, label: "OpenAI" },
+  { group: MODEL_CATALOG_GROUPS.GITHUB_COPILOT, label: "GitHub Copilot" },
+] as const;
+
 // Telegram limits callback_data to 64 bytes. We keep the public payload short
 // (`sess:<action>:<token>`) and store the project/session binding in memory so
 // the confirm step can still revalidate against the active project context.
 
 export function createTelegramRouter(deps: TelegramRouterDeps) {
   const sessionSelectionTokens = new Map<string, SessionSelectionTokenRecord>();
+  const modelSelectionTokens = new Map<string, ModelSelectionTokenRecord>();
+  const agentSelectionTokens = new Map<string, AgentSelectionTokenRecord>();
 
   return {
     async handleMessage(msg: TelegramBot.Message, authContext?: TelegramRouterAuthContext): Promise<void> {
@@ -291,7 +387,9 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
             chatType: msg.chat.type,
           },
           text,
-          sessionSelectionTokens
+          sessionSelectionTokens,
+          modelSelectionTokens,
+          agentSelectionTokens
         );
         return;
       }
@@ -305,6 +403,18 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
       }
 
       if (!chatId || !query.id) {
+        return;
+      }
+
+      const parsedPageCallback = parseSessionPageCallbackPayload(query.data);
+      if (parsedPageCallback) {
+        await handleSessionPaginationCallback({
+          deps,
+          chatId,
+          query,
+          payload: parsedPageCallback,
+          sessionSelectionTokens,
+        });
         return;
       }
 
@@ -329,6 +439,48 @@ export function createTelegramRouter(deps: TelegramRouterDeps) {
           chatType: query.message?.chat.type,
           query,
           payload: parsedDangerousCallback,
+        });
+        return;
+      }
+
+      const parsedModelCallback = parseModelSelectionCallbackPayload(query.data);
+      if (parsedModelCallback) {
+        await handleModelSelectionCallback({
+          deps,
+          chatId,
+          query,
+          payload: parsedModelCallback,
+          modelSelectionTokens,
+        });
+        return;
+      }
+
+      const parsedModelGroupCallback = parseModelGroupCallbackPayload(query.data);
+      if (parsedModelGroupCallback) {
+        await handleModelGroupCallback({
+          deps,
+          chatId,
+          query,
+          payload: parsedModelGroupCallback,
+          modelSelectionTokens,
+        });
+        return;
+      }
+
+      const parsedModelBackCallback = parseModelBackCallbackPayload(query.data);
+      if (parsedModelBackCallback) {
+        await handleModelBackCallback({ deps, chatId, query });
+        return;
+      }
+
+      const parsedAgentCallback = parseAgentSelectionCallbackPayload(query.data);
+      if (parsedAgentCallback) {
+        await handleAgentSelectionCallback({
+          deps,
+          chatId,
+          query,
+          payload: parsedAgentCallback,
+          agentSelectionTokens,
         });
         return;
       }
@@ -540,9 +692,11 @@ async function handleCommand(
     readonly chatType: string;
   },
   text: string,
-  sessionSelectionTokens: Map<string, SessionSelectionTokenRecord>
+  sessionSelectionTokens: Map<string, SessionSelectionTokenRecord>,
+  modelSelectionTokens: Map<string, ModelSelectionTokenRecord>,
+  agentSelectionTokens: Map<string, AgentSelectionTokenRecord>
 ): Promise<void> {
-  const intent = parseCommandIntent(text);
+  const intent = parseCommandIntent(text, { sesionAliasEnabled: deps.sesionAliasEnabled });
   const policy = resolveCommandPolicy(intent);
   const numericChatId = Number(commandContext.chatId);
   const send = (message: string, contentKind: TelegramContentKind = TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE) =>
@@ -595,6 +749,10 @@ async function handleCommand(
 
     if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.SESSIONS) {
       const activeProject = await loadActiveProjectContext(deps.persistence, commandContext.chatId);
+      traceSessionsDebug("router:active-project", {
+        chatId: commandContext.chatId,
+        activeProject,
+      });
       if (!activeProject) {
         await send(formatProjectSessionsRequireProject());
         return;
@@ -602,40 +760,45 @@ async function handleCommand(
 
       const inspection = await (deps.inspectProjectSessionsFn ?? inspectProjectSessions)({
         projectPath: activeProject.rootPath,
+        cwd: activeProject.rootPath,
         timeoutMs: deps.openCodeControlTimeoutMs ?? DEFAULT_OPEN_CODE_CONTROL_TIMEOUT_MS,
       });
 
       if (inspection.kind === PROJECT_SESSION_INSPECTION_RESULT_KIND.ERROR) {
+        traceSessionsDebug("router:inspection-error", {
+          chatId: commandContext.chatId,
+          activeProject,
+        });
         await send(formatProjectSessionsReadError());
         return;
       }
 
       const sessions = selectSafeProjectSessions(inspection);
+      traceSessionsDebug("router:safe-sessions", {
+        chatId: commandContext.chatId,
+        activeProject,
+        inspection,
+        safeCount: sessions.length,
+      });
       if (sessions.length === 0) {
-        await send(formatProjectSessionsEmpty());
+        await send(
+          `${formatProjectSessionsEmpty()}
+${formatProjectSessionsEmptyDebug({ activeRootPath: activeProject.rootPath, inspection })}`
+        );
         return;
       }
 
-      const keyboard = {
-        inline_keyboard: sessions.map((session) => {
-          const token = registerSessionSelectionToken(sessionSelectionTokens, {
-            chatId: commandContext.chatId,
-            projectId: activeProject.projectId,
-            projectPath: inspection.projectPath,
-            sessionId: session.sessionId,
-            origin: SESSION_SELECTION_TOKEN_ORIGIN.SESSION_SELECTION,
-          });
+      const firstPage = paginateSessions(sessions, 0);
+      const keyboard = buildProjectSessionsKeyboard({
+        sessions,
+        page: firstPage.page,
+        chatId: commandContext.chatId,
+        projectId: activeProject.projectId,
+        projectPath: inspection.projectPath,
+        sessionSelectionTokens,
+      });
 
-          return [
-            {
-              text: session.title?.trim() ? `${session.sessionId} · ${session.title.trim()}` : session.sessionId,
-              callback_data: buildSessionSelectionCallbackData(SESSION_SELECTION_CALLBACK_ACTION.SELECT, token),
-            },
-          ];
-        }),
-      } satisfies TelegramBot.InlineKeyboardMarkup;
-
-      await deps.bot.sendMessage(numericChatId, formatProjectSessions(inspection.projectPath, sessions), {
+      await deps.bot.sendMessage(numericChatId, formatProjectSessions(inspection.projectPath, firstPage.items), {
         reply_markup: keyboard,
       });
       return;
@@ -784,6 +947,142 @@ async function handleCommand(
       return;
     }
 
+    if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.AGENTS) {
+      if (!deps.useCases.listSupportedAgents) {
+        await send(formatUnknownError());
+        return;
+      }
+      const list = await deps.useCases.listSupportedAgents();
+      if (!deps.useCases.getActiveAgent) {
+        await send(formatUnknownError());
+        return;
+      }
+
+      const active = await deps.useCases.getActiveAgent(commandContext.chatId);
+      if (!active.ok) {
+        await send(formatDomainError(active.error));
+        return;
+      }
+
+      const keyboard = buildAgentSelectionKeyboard({
+        agents: list,
+        chatId: commandContext.chatId,
+        projectId: statusResult.value.projectId ?? "",
+        agentSelectionTokens,
+      });
+
+      await deps.bot.sendMessage(numericChatId, formatAgentList(list, active.value), {
+        reply_markup: keyboard,
+      });
+      return;
+    }
+
+    if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.MODELS) {
+      if (!deps.useCases.listAvailableModels) {
+        await send(formatUnknownError());
+        return;
+      }
+      const list = await deps.useCases.listAvailableModels(commandContext.chatId);
+      if (!list.ok) {
+        await send(formatDomainError(list.error));
+        return;
+      }
+      if (list.value.degraded && list.value.models.length === 0) {
+        await send(formatModelUnavailable(list.value.degraded));
+        return;
+      }
+      const keyboard = buildModelGroupKeyboard({ groups: MODEL_CATALOG_GROUP_ITEMS });
+      const message = list.value.degraded
+        ? `${formatModelGroupChooser()}\n${formatModelUnavailable(list.value.degraded)}`
+        : formatModelGroupChooser();
+
+      await deps.bot.sendMessage(numericChatId, message, {
+        reply_markup: keyboard,
+      });
+      return;
+    }
+
+    if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.MODEL) {
+      if (!deps.useCases.getActiveModel || !deps.useCases.setActiveModel) {
+        await send(formatUnknownError());
+        return;
+      }
+      if (!intent.args) {
+        const active = await deps.useCases.getActiveModel(commandContext.chatId);
+        if (!active.ok) {
+          await send(formatDomainError(active.error));
+          return;
+        }
+        await send(formatModelActive(active.value));
+        return;
+      }
+      const set = await deps.useCases.setActiveModel({ chatId: commandContext.chatId, model: intent.args });
+      if (!set.ok) {
+        if (set.error.code === "VALIDATION_ERROR") {
+          await send(formatInvalidModel());
+          return;
+        }
+        await send(formatDomainError(set.error));
+        return;
+      }
+      await send(
+        set.value.sessionReconfigured
+          ? formatModelActiveWithSessionReconfigured(set.value.activeModel, set.value.attachLocalReopened)
+          : formatModelActive(set.value.activeModel)
+      );
+      return;
+    }
+
+    if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.AGENT) {
+      if (!deps.useCases.getActiveAgent || !deps.useCases.setActiveAgent || !deps.useCases.listSupportedAgents) {
+        await send(formatUnknownError());
+        return;
+      }
+      if (!intent.args) {
+        const active = await deps.useCases.getActiveAgent(commandContext.chatId);
+        if (!active.ok) {
+          await send(formatDomainError(active.error));
+          return;
+        }
+
+        await send(formatAgentActive(active.value));
+        return;
+      }
+
+      const set = await deps.useCases.setActiveAgent({ chatId: commandContext.chatId, agent: intent.args });
+      if (!set.ok) {
+        if (set.error.code === "VALIDATION_ERROR" && set.error.message === "Agente no válido") {
+          await send(formatInvalidAgent(await deps.useCases.listSupportedAgents()));
+          return;
+        }
+        await send(formatDomainError(set.error));
+        return;
+      }
+
+      await send(
+        set.value.sessionReconfigured
+          ? formatAgentActiveWithSessionReconfigured(set.value.activeAgent, set.value.attachLocalReopened)
+          : formatAgentActive(set.value.activeAgent)
+      );
+      return;
+    }
+
+    if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.AGENT_SYNC) {
+      if (!deps.useCases.refreshSessionMetadata) {
+        await send(formatUnknownError());
+        return;
+      }
+
+      const sync = await deps.useCases.refreshSessionMetadata(commandContext.chatId);
+      if (!sync.ok) {
+        await send(formatDomainError(sync.error));
+        return;
+      }
+
+      await send(formatAgentSyncNotice(sync.value));
+      return;
+    }
+
     if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.NEW) {
       if (!intent.args) {
         await send(formatUsage("new"));
@@ -886,6 +1185,11 @@ async function handleCommand(
       return;
     }
 
+    if (intent.raw === "sesion" && deps.sesionAliasEnabled === false) {
+      await send(formatSesionTypoGuidance());
+      return;
+    }
+
     await send(formatCommandCatalog(buildCommandCatalog(deps, commandContext.chatType), intent.raw));
   } catch (error) {
     logger.error("Telegram command handling failed", {
@@ -905,6 +1209,10 @@ async function handleCommand(
 
 function resolveCommandPolicy(intent: TelegramCommandIntent): CommandPolicy {
   if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.PROJECT && intent.args) {
+    return COMMAND_POLICY.MUTATING;
+  }
+
+  if (intent.kind === TELEGRAM_COMMAND_INTENT_KIND.AGENT && intent.args) {
     return COMMAND_POLICY.MUTATING;
   }
 
@@ -1045,12 +1353,12 @@ async function handleText(deps: TelegramRouterDeps, chatId: string, text: string
 
     const result = await deps.useCases.sendText({ chatId, text });
     if (!result.ok) {
-      await send(formatDomainError(result.error));
+      await send(formatExecutionErrorWithMetadata(result.error));
       return;
     }
 
     await send(
-      formatSendSuccess(result.value.reply ?? result.value.message, result.value.needsAttention),
+      formatSendSuccess(result.value.reply ?? result.value.message, result.value.needsAttention, result.value),
       TELEGRAM_CONTENT_KIND.MODEL
     );
   } catch (error) {
@@ -1065,6 +1373,23 @@ async function handleText(deps: TelegramRouterDeps, chatId: string, text: string
       contentKind: TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE,
     });
   }
+}
+
+function formatExecutionErrorWithMetadata(error: DomainError): string {
+  const details = error.details as Record<string, unknown> | undefined;
+  const requestedAgent = typeof details?.requestedAgent === "string" ? details.requestedAgent : undefined;
+  const requestedModel = typeof details?.requestedModel === "string" ? details.requestedModel : undefined;
+  const effectiveAgent = typeof details?.effectiveAgent === "string" ? details.effectiveAgent : undefined;
+  const effectiveModel = typeof details?.effectiveModel === "string" ? details.effectiveModel : undefined;
+
+  if (!requestedAgent && !requestedModel && !effectiveAgent && !effectiveModel) {
+    return formatDomainError(error);
+  }
+
+  return [
+    formatDomainError(error),
+    formatExecutionMetadataBlock({ requestedAgent, requestedModel, effectiveAgent, effectiveModel }),
+  ].join("\n");
 }
 
 async function handleSessionSelectionCallback(input: {
@@ -1207,6 +1532,130 @@ async function handleSessionSelectionCallback(input: {
     bot: input.deps.bot,
     chatId: Number(input.chatId),
     text: formatSessionLinked(result.value.sessionId, result.value.projectId),
+  });
+}
+
+const SESSIONS_PAGE_SIZE = 5;
+
+function paginateSessions(sessions: readonly ProjectSessionListItem[], requestedPage: number): {
+  readonly page: number;
+  readonly totalPages: number;
+  readonly items: readonly ProjectSessionListItem[];
+} {
+  const totalPages = Math.max(1, Math.ceil(sessions.length / SESSIONS_PAGE_SIZE));
+  const page = Math.max(0, Math.min(requestedPage, totalPages - 1));
+  const start = page * SESSIONS_PAGE_SIZE;
+  const end = start + SESSIONS_PAGE_SIZE;
+  return {
+    page,
+    totalPages,
+    items: sessions.slice(start, end),
+  };
+}
+
+function buildProjectSessionsKeyboard(input: {
+  readonly sessions: readonly ProjectSessionListItem[];
+  readonly page: number;
+  readonly chatId: string;
+  readonly projectId: string;
+  readonly projectPath: string;
+  readonly sessionSelectionTokens: Map<string, SessionSelectionTokenRecord>;
+}): TelegramBot.InlineKeyboardMarkup {
+  const current = paginateSessions(input.sessions, input.page);
+  const rows: TelegramBot.InlineKeyboardButton[][] = current.items.map((session) => {
+    const token = registerSessionSelectionToken(input.sessionSelectionTokens, {
+      chatId: input.chatId,
+      projectId: input.projectId,
+      projectPath: input.projectPath,
+      sessionId: session.sessionId,
+      origin: SESSION_SELECTION_TOKEN_ORIGIN.SESSION_SELECTION,
+    });
+
+    const title = session.title?.trim() || "Sin título";
+    return [{
+      text: title,
+      callback_data: buildSessionSelectionCallbackData(SESSION_SELECTION_CALLBACK_ACTION.SELECT, token),
+    }];
+  });
+
+  if (current.totalPages > 1) {
+    const pager: TelegramBot.InlineKeyboardButton[] = [];
+    if (current.page > 0) {
+      pager.push({
+        text: "⬅️ Anterior",
+        callback_data: buildSessionPageCallbackData(current.page - 1),
+      });
+    }
+    pager.push({
+      text: `${current.page + 1}/${current.totalPages}`,
+      callback_data: buildSessionPageCallbackData(current.page),
+    });
+    if (current.page < current.totalPages - 1) {
+      pager.push({
+        text: "Siguiente ➡️",
+        callback_data: buildSessionPageCallbackData(current.page + 1),
+      });
+    }
+    rows.push(pager);
+  }
+
+  return { inline_keyboard: rows };
+}
+
+async function handleSessionPaginationCallback(input: {
+  readonly deps: TelegramRouterDeps;
+  readonly chatId: string;
+  readonly query: TelegramBot.CallbackQuery;
+  readonly payload: SessionPageCallbackPayload;
+  readonly sessionSelectionTokens: Map<string, SessionSelectionTokenRecord>;
+}): Promise<void> {
+  const activeProject = await loadActiveProjectContext(input.deps.persistence, input.chatId);
+  if (!activeProject) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "Primero elegí proyecto.",
+      show_alert: false,
+    });
+    return;
+  }
+
+  const inspection = await (input.deps.inspectProjectSessionsFn ?? inspectProjectSessions)({
+    projectPath: activeProject.rootPath,
+    timeoutMs: input.deps.openCodeControlTimeoutMs ?? DEFAULT_OPEN_CODE_CONTROL_TIMEOUT_MS,
+  });
+  if (inspection.kind === PROJECT_SESSION_INSPECTION_RESULT_KIND.ERROR) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "No pude consultar OpenCode.",
+      show_alert: false,
+    });
+    return;
+  }
+
+  const sessions = selectSafeProjectSessions(inspection);
+  if (sessions.length === 0) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, {
+      text: "Sin sesiones disponibles.",
+      show_alert: false,
+    });
+    return;
+  }
+
+  const page = paginateSessions(sessions, input.payload.page);
+  const keyboard = buildProjectSessionsKeyboard({
+    sessions,
+    page: page.page,
+    chatId: input.chatId,
+    projectId: activeProject.projectId,
+    projectPath: inspection.projectPath,
+    sessionSelectionTokens: input.sessionSelectionTokens,
+  });
+
+  await input.deps.bot.answerCallbackQuery(input.query.id, {
+    text: `Página ${page.page + 1}/${page.totalPages}`,
+    show_alert: false,
+  });
+
+  await input.deps.bot.sendMessage(Number(input.chatId), formatProjectSessions(inspection.projectPath, page.items), {
+    reply_markup: keyboard,
   });
 }
 
@@ -1428,11 +1877,386 @@ function buildSessionSelectionCallbackData(action: SessionSelectionCallbackActio
   return `${SESSION_SELECTION_CALLBACK_PREFIX}:${action}:${token}`;
 }
 
+function traceSessionsDebug(label: string, payload: unknown): void {
+  if (process.env.TGOC_TRACE_SESSIONS !== "1") {
+    return;
+  }
+
+  console.log(`[tgoc/sesiones] ${label}`, payload);
+}
+
+function buildSessionPageCallbackData(page: number): string {
+  return `${SESSION_PAGE_CALLBACK_PREFIX}:${page}`;
+}
+
 function buildDangerousActionCallbackData(
   action: DangerousActionCallbackAction,
   confirmationId: string
 ): string {
   return `${DANGEROUS_ACTION_CALLBACK_PREFIX}:${action}:${confirmationId}`;
+}
+
+function buildModelSelectionCallbackData(token: string): string {
+  return `${MODEL_SELECTION_CALLBACK_PREFIX}:sel:${token}`;
+}
+
+function buildModelGroupCallbackData(group: ModelCatalogGroup): string {
+  return `mg:grp:${group}`;
+}
+
+function buildModelBackCallbackData(): string {
+  return "mg:back";
+}
+
+function buildAgentSelectionCallbackData(token: string): string {
+  return `${AGENT_SELECTION_CALLBACK_PREFIX}:sel:${token}`;
+}
+
+function parseModelGroupCallbackPayload(data: string | undefined): { readonly group: ModelCatalogGroup } | undefined {
+  if (!data || !data.startsWith("mg:grp:")) return undefined;
+  const [, , group] = data.split(":");
+  if (!group || !Object.values(MODEL_CATALOG_GROUPS).includes(group as ModelCatalogGroup)) return undefined;
+  return { group: group as ModelCatalogGroup };
+}
+
+function parseModelBackCallbackPayload(data: string | undefined): { readonly back: true } | undefined {
+  if (data !== "mg:back") return undefined;
+  return { back: true };
+}
+
+function parseModelSelectionCallbackPayload(data: string | undefined): ModelSelectionCallbackPayload | undefined {
+  if (!data || !data.startsWith(`${MODEL_SELECTION_CALLBACK_PREFIX}:`)) {
+    return undefined;
+  }
+
+  const [prefix, action, token] = data.split(":");
+  if (prefix !== MODEL_SELECTION_CALLBACK_PREFIX || action !== "sel" || !token) {
+    return undefined;
+  }
+
+  return { action: MODEL_SELECTION_CALLBACK_ACTION.SELECT, token };
+}
+
+function parseAgentSelectionCallbackPayload(data: string | undefined): AgentSelectionCallbackPayload | undefined {
+  if (!data || !data.startsWith(`${AGENT_SELECTION_CALLBACK_PREFIX}:`)) {
+    return undefined;
+  }
+
+  const [prefix, action, token] = data.split(":");
+  if (prefix !== AGENT_SELECTION_CALLBACK_PREFIX || action !== "sel" || !token) {
+    return undefined;
+  }
+
+  return { action: AGENT_SELECTION_CALLBACK_ACTION.SELECT, token };
+}
+
+function buildModelSelectionKeyboard(input: {
+  readonly models: readonly string[];
+  readonly chatId: string;
+  readonly projectId: string;
+  readonly modelSelectionTokens: Map<string, ModelSelectionTokenRecord>;
+}): TelegramBot.InlineKeyboardMarkup {
+  return {
+    inline_keyboard: input.models.map((model) => [
+      {
+        text: model,
+        callback_data: buildModelSelectionCallbackData(buildModelSelectionToken(input.modelSelectionTokens, {
+          chatId: input.chatId,
+          projectId: input.projectId,
+          group: input.models[0]?.split("/")[0] ?? "models",
+          model,
+        })),
+      },
+    ]),
+  };
+}
+
+function buildModelGroupKeyboard(input: {
+  readonly groups: readonly ModelCatalogGroupItem[];
+}): TelegramBot.InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      input.groups.map((group) => ({
+        text: group.label,
+        callback_data: buildModelGroupCallbackData(group.group as ModelCatalogGroup),
+      })),
+    ],
+  };
+}
+
+function buildModelBackKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[{ text: "⬅️ Volver", callback_data: buildModelBackCallbackData() }]],
+  };
+}
+
+function buildAgentSelectionKeyboard(input: {
+  readonly agents: readonly string[];
+  readonly chatId: string;
+  readonly projectId: string;
+  readonly agentSelectionTokens: Map<string, AgentSelectionTokenRecord>;
+}): TelegramBot.InlineKeyboardMarkup {
+  return {
+    inline_keyboard: input.agents.map((agent) => [
+      {
+        text: agent,
+        callback_data: buildAgentSelectionCallbackData(buildAgentSelectionToken(input.agentSelectionTokens, {
+          chatId: input.chatId,
+          projectId: input.projectId,
+          group: "agents",
+          agent,
+        })),
+      },
+    ]),
+  };
+}
+
+function buildModelSelectionToken(
+  tokens: Map<string, ModelSelectionTokenRecord>,
+  selection: Omit<ModelSelectionTokenRecord, "createdAt">
+): string {
+  purgeExpiredModelSelectionTokens(tokens);
+  const token = randomUUID().replace(/-/gu, "").slice(0, 12);
+  tokens.set(token, { ...selection, createdAt: Date.now() });
+  return token;
+}
+
+function buildAgentSelectionToken(
+  tokens: Map<string, AgentSelectionTokenRecord>,
+  selection: Omit<AgentSelectionTokenRecord, "createdAt">
+): string {
+  purgeExpiredAgentSelectionTokens(tokens);
+  const token = randomUUID().replace(/-/gu, "").slice(0, 12);
+  tokens.set(token, { ...selection, createdAt: Date.now() });
+  return token;
+}
+
+function takeModelSelectionToken(tokens: Map<string, ModelSelectionTokenRecord>, token: string): ModelSelectionTokenRecord | undefined {
+  purgeExpiredModelSelectionTokens(tokens);
+  const selection = tokens.get(token);
+  if (!selection) return undefined;
+  tokens.delete(token);
+  return selection;
+}
+
+function takeAgentSelectionToken(tokens: Map<string, AgentSelectionTokenRecord>, token: string): AgentSelectionTokenRecord | undefined {
+  purgeExpiredAgentSelectionTokens(tokens);
+  const selection = tokens.get(token);
+  if (!selection) return undefined;
+  tokens.delete(token);
+  return selection;
+}
+
+function purgeExpiredModelSelectionTokens(tokens: Map<string, ModelSelectionTokenRecord>): void {
+  const expirationTime = Date.now() - 15 * 60 * 1000;
+  for (const [token, selection] of tokens.entries()) {
+    if (selection.createdAt < expirationTime) tokens.delete(token);
+  }
+}
+
+function purgeExpiredAgentSelectionTokens(tokens: Map<string, AgentSelectionTokenRecord>): void {
+  const expirationTime = Date.now() - 15 * 60 * 1000;
+  for (const [token, selection] of tokens.entries()) {
+    if (selection.createdAt < expirationTime) tokens.delete(token);
+  }
+}
+
+async function handleModelSelectionCallback(input: {
+  readonly deps: TelegramRouterDeps;
+  readonly chatId: string;
+  readonly query: TelegramBot.CallbackQuery;
+  readonly payload: ModelSelectionCallbackPayload;
+  readonly modelSelectionTokens: Map<string, ModelSelectionTokenRecord>;
+}): Promise<void> {
+  const selection = takeModelSelectionToken(input.modelSelectionTokens, input.payload.token);
+  if (!selection || selection.chatId !== input.chatId) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, { text: "Acción inválida o desactualizada.", show_alert: false });
+    return;
+  }
+
+  const activeProject = await loadActiveProjectContext(input.deps.persistence, input.chatId);
+  if (!activeProject || activeProject.projectId !== selection.projectId) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, { text: "Proyecto activo cambiado.", show_alert: false });
+    return;
+  }
+
+  const set = await input.deps.useCases.setActiveModel?.({ chatId: input.chatId, model: selection.model });
+  if (!set) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, { text: "No puedo cambiar el modelo en esta instancia.", show_alert: false });
+    return;
+  }
+
+  if (!set.ok) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, { text: "No pude cambiar el modelo.", show_alert: false });
+    await sendTelegramText({ bot: input.deps.bot, chatId: Number(input.chatId), text: formatDomainError(set.error) });
+    return;
+  }
+
+  await input.deps.bot.answerCallbackQuery(input.query.id, { text: "Modelo actualizado.", show_alert: false });
+  await sendTelegramText({
+    bot: input.deps.bot,
+    chatId: Number(input.chatId),
+    text: set.value.attachLocalReopened
+      ? formatModelActiveWithSessionReconfigured(set.value.activeModel, true)
+      : formatModelActive(set.value.activeModel),
+  });
+}
+
+async function handleModelGroupCallback(input: {
+  readonly deps: TelegramRouterDeps;
+  readonly chatId: string;
+  readonly query: TelegramBot.CallbackQuery;
+  readonly payload: { readonly group: ModelCatalogGroup };
+  readonly modelSelectionTokens: Map<string, ModelSelectionTokenRecord>;
+}): Promise<void> {
+  const activeProject = await loadActiveProjectContext(input.deps.persistence, input.chatId);
+  if (!activeProject) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, { text: "Primero elegí proyecto.", show_alert: false });
+    return;
+  }
+
+  const catalog = await resolveModelCatalogGroup(input.deps, input.chatId, input.payload.group);
+  const keyboard = buildModelSelectionKeyboardForGroup({
+    models: catalog.models,
+    chatId: input.chatId,
+    projectId: activeProject.projectId,
+    group: input.payload.group,
+    modelSelectionTokens: input.modelSelectionTokens,
+  });
+
+  await input.deps.bot.answerCallbackQuery(input.query.id, {
+    text: `Grupo ${input.payload.group}`,
+    show_alert: false,
+  });
+
+  await input.deps.bot.sendMessage(Number(input.chatId), formatModelGroupList(input.payload.group, catalog.models, catalog.activeModel), {
+    reply_markup: keyboard,
+  });
+}
+
+async function handleModelBackCallback(input: {
+  readonly deps: TelegramRouterDeps;
+  readonly chatId: string;
+  readonly query: TelegramBot.CallbackQuery;
+}): Promise<void> {
+  await input.deps.bot.answerCallbackQuery(input.query.id, { text: "Volviendo.", show_alert: false });
+  await input.deps.bot.sendMessage(Number(input.chatId), formatModelGroupChooser(), {
+    reply_markup: buildModelGroupKeyboard({
+      groups: MODEL_CATALOG_GROUP_ITEMS,
+    }),
+  });
+}
+
+function buildModelSelectionKeyboardForGroup(input: {
+  readonly models: readonly string[];
+  readonly chatId: string;
+  readonly projectId: string;
+  readonly group: ModelCatalogGroup;
+  readonly modelSelectionTokens: Map<string, ModelSelectionTokenRecord>;
+}): TelegramBot.InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      ...input.models.map((model) => [
+        {
+          text: model,
+          callback_data: buildModelSelectionCallbackData(buildModelSelectionToken(input.modelSelectionTokens, {
+            chatId: input.chatId,
+            projectId: input.projectId,
+            group: input.group,
+            model,
+          })),
+        },
+      ]),
+      [{ text: "⬅️ Volver", callback_data: buildModelBackCallbackData() }],
+    ],
+  };
+}
+
+function formatModelGroupChooser(): string {
+  return [
+    "Elegí una suscripción:",
+    ...MODEL_CATALOG_GROUP_ITEMS.map((item) => `• ${item.label}`),
+  ].join("\n");
+}
+
+function formatModelGroupList(group: ModelCatalogGroup, models: readonly string[], activeModel?: string): string {
+  const groupLabel = formatModelGroupLabel(group);
+  const lines = models.map((model) => (model === activeModel ? `• ✅ ${model}` : `• ${model}`));
+  return [
+    activeModel ? `Modelos ${groupLabel} (activo: ${activeModel}):` : `Modelos ${groupLabel}:`,
+    lines.length > 0 ? lines.join("\n") : "No hay modelos disponibles.",
+    "⬅️ Volvé para elegir otra suscripción.",
+  ].join("\n");
+}
+
+function formatModelGroupLabel(group: ModelCatalogGroup): string {
+  switch (group) {
+    case MODEL_CATALOG_GROUPS.OPENCODE:
+      return "OpenCode";
+    case MODEL_CATALOG_GROUPS.OPENAI:
+      return "OpenAI";
+    case MODEL_CATALOG_GROUPS.GITHUB_COPILOT:
+      return "GitHub Copilot";
+  }
+}
+
+async function resolveModelCatalogGroup(
+  deps: TelegramRouterDeps,
+  chatId: string,
+  group: ModelCatalogGroup
+): Promise<{ readonly models: readonly string[]; readonly activeModel?: string }> {
+  if (!deps.useCases.listAvailableModels) {
+    return { models: [] };
+  }
+
+  const result = await deps.useCases.listAvailableModels(chatId);
+  if (!result.ok) return { models: [] };
+
+  return {
+    models: result.value.models.filter((model) => model.startsWith(`${group}/`) || (group === MODEL_CATALOG_GROUPS.OPENCODE && model.startsWith("opencode/"))),
+    activeModel: result.value.activeModel,
+  };
+}
+
+async function handleAgentSelectionCallback(input: {
+  readonly deps: TelegramRouterDeps;
+  readonly chatId: string;
+  readonly query: TelegramBot.CallbackQuery;
+  readonly payload: AgentSelectionCallbackPayload;
+  readonly agentSelectionTokens: Map<string, AgentSelectionTokenRecord>;
+}): Promise<void> {
+  const selection = takeAgentSelectionToken(input.agentSelectionTokens, input.payload.token);
+  if (!selection || selection.chatId !== input.chatId) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, { text: "Acción inválida o desactualizada.", show_alert: false });
+    return;
+  }
+
+  const activeProject = await loadActiveProjectContext(input.deps.persistence, input.chatId);
+  if (!activeProject || activeProject.projectId !== selection.projectId) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, { text: "Proyecto activo cambiado.", show_alert: false });
+    return;
+  }
+
+  const set = await input.deps.useCases.setActiveAgent?.({ chatId: input.chatId, agent: selection.agent });
+  if (!set) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, { text: "No puedo cambiar el agente en esta instancia.", show_alert: false });
+    return;
+  }
+
+  if (!set.ok) {
+    await input.deps.bot.answerCallbackQuery(input.query.id, { text: "No pude cambiar el agente.", show_alert: false });
+    await sendTelegramText({ bot: input.deps.bot, chatId: Number(input.chatId), text: formatDomainError(set.error) });
+    return;
+  }
+
+  await input.deps.bot.answerCallbackQuery(input.query.id, { text: "Agente actualizado.", show_alert: false });
+  await sendTelegramText({
+    bot: input.deps.bot,
+    chatId: Number(input.chatId),
+    text: set.value.attachLocalReopened
+      ? formatAgentActiveWithSessionReconfigured(set.value.activeAgent, true)
+      : formatAgentActive(set.value.activeAgent),
+  });
 }
 
 function parseSessionSelectionCallbackPayload(data: string | undefined): SessionSelectionCallbackPayload | undefined {
@@ -1454,6 +2278,24 @@ function parseSessionSelectionCallbackPayload(data: string | undefined): Session
     action: action as SessionSelectionCallbackAction,
     token,
   };
+}
+
+function parseSessionPageCallbackPayload(data: string | undefined): SessionPageCallbackPayload | undefined {
+  if (!data || !data.startsWith(`${SESSION_PAGE_CALLBACK_PREFIX}:`)) {
+    return undefined;
+  }
+
+  const [prefix, rawPage] = data.split(":");
+  if (prefix !== SESSION_PAGE_CALLBACK_PREFIX || !rawPage) {
+    return undefined;
+  }
+
+  const page = Number.parseInt(rawPage, 10);
+  if (!Number.isFinite(page) || page < 0) {
+    return undefined;
+  }
+
+  return { page };
 }
 
 function parsePromptCallbackPayload(data: string | undefined): { promptId: string; choice: string } | undefined {
@@ -1568,9 +2410,25 @@ function extractArgs(text: string): string {
   return text.slice(firstSpace + 1).trim();
 }
 
-function parseCommandIntent(text: string): TelegramCommandIntent {
+function parseCommandIntent(
+  text: string,
+  options?: {
+    readonly sesionAliasEnabled?: boolean;
+  }
+): TelegramCommandIntent {
   const command = normalizeCommand(text);
   const args = extractArgs(text);
+  const sesionAliasEnabled = options?.sesionAliasEnabled ?? true;
+
+  if (!sesionAliasEnabled && command === "sesion") {
+    return {
+      kind: TELEGRAM_COMMAND_INTENT_KIND.UNKNOWN,
+      raw: command,
+      args: args || undefined,
+      aliasUsed: command,
+    };
+  }
+
   const kind = COMMAND_ALIASES[command as keyof typeof COMMAND_ALIASES] ?? TELEGRAM_COMMAND_INTENT_KIND.UNKNOWN;
 
   return {

@@ -1,6 +1,8 @@
 import {
   ActiveTask,
   ATTACH_LOCAL_EXECUTION_RESULT,
+  AgentSelection,
+  ModelSelection,
   ChatBinding,
   DangerousActionConfirmation,
   DangerousActionConfirmationStatus,
@@ -12,6 +14,7 @@ import {
   PromptType,
   Project,
   Session,
+  SupportedAgent,
 } from "../domain/entities";
 import { DomainError } from "../domain/errors";
 
@@ -114,6 +117,10 @@ export interface SessionState {
   status: RemoteSessionStatus;
   taskId?: string;
   updatedAt?: string;
+  requestedAgent?: string;
+  requestedModel?: string;
+  effectiveAgent?: string;
+  effectiveModel?: string;
 }
 
 export interface BootstrapSessionInput {
@@ -209,6 +216,14 @@ export const ASYNC_SESSION_NOTICE_KIND = {
 export type AsyncSessionNoticeKind =
   (typeof ASYNC_SESSION_NOTICE_KIND)[keyof typeof ASYNC_SESSION_NOTICE_KIND];
 
+export interface EffectiveFallbackInfo {
+  readonly kind: "model-fallback" | "agent-override" | "multiple";
+  readonly requestedAgent?: string;
+  readonly effectiveAgent?: string;
+  readonly requestedModel?: string;
+  readonly effectiveModel?: string;
+}
+
 export interface AsyncSessionNotice {
   readonly chatId: string;
   readonly kind: AsyncSessionNoticeKind;
@@ -218,6 +233,11 @@ export interface AsyncSessionNotice {
   readonly terminalCause?: string;
   readonly terminalSource?: TerminalEventSource;
   readonly summary?: string;
+  readonly requestedAgent?: string;
+  readonly requestedModel?: string;
+  readonly effectiveAgent?: string;
+  readonly effectiveModel?: string;
+  readonly fallbackInfo?: EffectiveFallbackInfo;
   readonly prompt?: {
     readonly promptId: string;
     readonly promptType: PromptType;
@@ -241,6 +261,23 @@ export interface SendResult {
   needsAttention?: boolean;
   status?: RemoteSessionStatus;
   state: SessionState;
+  requestedAgent?: string;
+  requestedModel?: string;
+  effectiveAgent?: string;
+  effectiveModel?: string;
+  modelValidationDegraded?: ModelCatalogDegradeReason;
+  fallbackInfo?: EffectiveFallbackInfo;
+}
+
+export interface SessionMetadataSyncResult {
+  readonly chatId: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly changed: boolean;
+  readonly requestedAgent?: string;
+  readonly requestedModel?: string;
+  readonly effectiveAgent?: string;
+  readonly effectiveModel?: string;
 }
 
 export interface ObserveSessionResult {
@@ -300,6 +337,42 @@ export interface PendingPromptRepository {
   findActiveBySessionId(sessionId: string): Promise<PendingPrompt | undefined>;
   listAll(): Promise<PendingPrompt[]>;
   upsert(prompt: PendingPrompt): Promise<void>;
+}
+
+export interface AgentSelectionRepository {
+  findByChatAndProject(chatId: string, projectId: string): Promise<AgentSelection | undefined>;
+  upsert(selection: AgentSelection): Promise<void>;
+}
+
+export const MODEL_CATALOG_DEGRADE_REASON = {
+  TIMEOUT: "timeout",
+  UNAVAILABLE: "unavailable",
+  UNSUPPORTED: "unsupported",
+  UPSTREAM: "upstream",
+} as const;
+
+export type ModelCatalogDegradeReason =
+  (typeof MODEL_CATALOG_DEGRADE_REASON)[keyof typeof MODEL_CATALOG_DEGRADE_REASON];
+
+export interface ModelCatalogItem {
+  readonly id: string;
+  readonly label?: string;
+  readonly source: "http" | "cli" | "pty";
+}
+
+export interface ModelCatalogResult {
+  readonly ok: boolean;
+  readonly models: readonly ModelCatalogItem[];
+  readonly fetchedAt: string;
+  readonly degraded?: {
+    readonly reason: ModelCatalogDegradeReason;
+    readonly usingCache: boolean;
+  };
+}
+
+export interface ModelSelectionRepository {
+  findByChatAndProject(chatId: string, projectId: string): Promise<ModelSelection | undefined>;
+  upsert(selection: ModelSelection): Promise<void>;
 }
 
 export const SENSITIVE_ACTION_AUDIT_RESULT = {
@@ -389,6 +462,8 @@ export interface PersistenceUnit {
   bindings: BindingRepository;
   states: StateRepository;
   tasks: ActiveTaskRepository;
+  agentSelections?: AgentSelectionRepository;
+  modelSelections?: ModelSelectionRepository;
   pendingPrompts: PendingPromptRepository;
   dangerousActionConfirmations?: DangerousActionConfirmationRepository;
 }
@@ -400,19 +475,32 @@ export interface PersistenceDriver {
 export interface OpenCodeSessionAdapter {
   resolveProject(input: { projectId: string; rootPath: string }): Promise<Result<{ canonicalPath: string }>>;
   bootstrapSession?(input: BootstrapSessionInput): Promise<Result<SessionState>>;
+  configureSessionAgent?(input: {
+    projectId: string;
+    sessionId: string;
+    agent: SupportedAgent;
+  }): Promise<Result<{ projectId: string; sessionId: string; agent: SupportedAgent }>>;
+  listModels?(input: { projectId: string; sessionId?: string; chatId: string }): Promise<Result<ModelCatalogResult>>;
+  configureSessionModel?(input: {
+    projectId: string;
+    sessionId: string;
+    model: string;
+  }): Promise<Result<{ projectId: string; sessionId: string; model: string }>>;
   createSession(input: {
     projectId: string;
     rootPath: string;
     source: "telegram";
     watch?: SessionWatcherRegistration;
   }): Promise<Result<SessionState>>;
-  attachSession(input: { projectId: string; sessionId: string }): Promise<Result<SessionState>>;
+  attachSession(input: { projectId: string; sessionId: string; model?: string }): Promise<Result<SessionState>>;
   sendMessage(input: {
     projectId: string;
     sessionId: string;
     message: string;
     chatId: string;
     watch?: SessionWatcherRegistration;
+    agent?: SupportedAgent;
+    model?: string;
   }): Promise<Result<SendResult>>;
   runCommand(input: {
     projectId: string;
@@ -420,6 +508,8 @@ export interface OpenCodeSessionAdapter {
     command: string;
     chatId: string;
     watch?: SessionWatcherRegistration;
+    agent?: SupportedAgent;
+    model?: string;
   }): Promise<Result<SendResult>>;
   getSessionState(input: { projectId: string; sessionId: string }): Promise<Result<SessionState>>;
   cancelOrInterrupt(input: {
@@ -432,5 +522,6 @@ export interface OpenCodeSessionAdapter {
     sessionId: string;
     chatId: string;
   }): Promise<Result<ObserveSessionResult>>;
+  refreshSessionMetadata?(input: { chatId: string }): Promise<Result<SessionMetadataSyncResult>>;
   submitPromptInput(input: ResumePromptInput): Promise<Result<SubmitPromptInputResult>>;
 }

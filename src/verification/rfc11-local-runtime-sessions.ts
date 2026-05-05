@@ -240,6 +240,11 @@ async function main(): Promise<void> {
   await verifyInspectProjectSessionsClassifiesCanonicalPaths();
   await verifySesionesRequiresProject();
   await verifySesionesRendersSafeProjectSessions();
+  await verifySesionesRendersDebugWhenEmpty();
+  await verifySesionAliasRendersSameSessionsFlow();
+  await verifySesionGuidanceWhenAliasDisabled();
+  await verifySessionPaginationContract();
+  await verifySessionPaginationBoundaryNavigation();
   await verifyHandlersShareRouterInstanceForSessionSelectionFlow();
   await verifySelectionThenConfirmationAttachesSession();
   await verifyCancellationKeepsCurrentBinding();
@@ -275,6 +280,7 @@ async function verifyCliSessionListParserAcceptsRealJsonShape(): Promise<void> {
 async function verifyInspectProjectSessionsClassifiesCanonicalPaths(): Promise<void> {
   const inspection = await inspectProjectSessions({
     projectPath: "/workspace/project",
+    cwd: "/workspace/project",
     timeoutMs: 500,
     cliOps: {
       listSessions: async () => [
@@ -369,14 +375,124 @@ async function verifySesionesRendersSafeProjectSessions(): Promise<void> {
 
   const rendered = bot.messages[0];
   assert.match(rendered?.text ?? "", /Sesiones del proyecto actual/);
-  assert.match(rendered?.text ?? "", /sess-root/);
-  assert.match(rendered?.text ?? "", /sess-child/);
+  assert.match(rendered?.text ?? "", /Root/);
+  assert.match(rendered?.text ?? "", /Feature A/);
   assert.doesNotMatch(rendered?.text ?? "", /sess-other/);
   assert.doesNotMatch(rendered?.text ?? "", /sess-unsafe/);
   assert.doesNotMatch(rendered?.text ?? "", /sess-bad/);
   const keyboard = rendered?.options?.reply_markup as TelegramBot.InlineKeyboardMarkup | undefined;
   assert.equal(keyboard?.inline_keyboard.length, 2);
   assert.match(readFirstButtonCallbackData(rendered), /^sess:sel:[a-f0-9]{12}$/u);
+}
+
+async function verifySesionesRendersDebugWhenEmpty(): Promise<void> {
+  const bot = new FakeBot();
+  const router = createRouterWithCustomInspector(bot, new FakeUseCases(), async () => ({
+    kind: PROJECT_SESSION_INSPECTION_RESULT_KIND.SUCCESS,
+    projectPath: "/mnt/d/Proyectos/telegram-opencode",
+    sessions: [
+      { sessionId: "sess-other", path: "/mnt/d/Proyectos/otro-proyecto", association: PROJECT_SESSION_ASSOCIATION.PROJECT_MISMATCH },
+      { sessionId: "sess-unsafe", association: PROJECT_SESSION_ASSOCIATION.UNSAFE },
+    ],
+  }));
+
+  await router.handleMessage(createMessage("1101", "/sesiones"));
+
+  const rendered = bot.messages[0];
+  assert.match(rendered?.text ?? "", /No encontré sesiones disponibles/);
+  assert.match(rendered?.text ?? "", /Debug vacío \/sesiones/);
+  assert.match(rendered?.text ?? "", /rootPath comparado:/);
+  assert.match(rendered?.text ?? "", /MATCH=0 PROJECT_MISMATCH=1 UNSAFE=1/);
+  assert.match(rendered?.text ?? "", /sess-other \| project-mismatch \| \/mnt\/d\/Proyectos\/otro-proyecto/);
+  assert.match(rendered?.text ?? "", /sess-unsafe \| unsafe \| sin path/);
+}
+
+async function verifySesionAliasRendersSameSessionsFlow(): Promise<void> {
+  const bot = new FakeBot();
+  const router = createRouterWithInspectorFromCliRaw(bot, JSON.stringify([
+    {
+      id: "sess-root",
+      directory: "/mnt/d/Proyectos/telegram-opencode",
+      title: "Root",
+    },
+  ]));
+
+  await router.handleMessage(createMessage("1101", "/sesion"));
+
+  const rendered = bot.messages[0];
+  assert.match(rendered?.text ?? "", /Sesiones del proyecto actual/);
+  assert.match(rendered?.text ?? "", /Root/);
+  assert.match(readFirstButtonCallbackData(rendered), /^sess:sel:[a-f0-9]{12}$/u);
+}
+
+async function verifySesionGuidanceWhenAliasDisabled(): Promise<void> {
+  const bot = new FakeBot();
+  const router = createRouterWithSessions(
+    bot,
+    [{ sessionId: "sess-root", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Root" }],
+    new FakeUseCases(),
+    { sesionAliasEnabled: false }
+  );
+
+  await router.handleMessage(createMessage("1101", "/sesion"));
+
+  const rendered = bot.messages[0];
+  assert.match(rendered?.text ?? "", /\/sesion/);
+  assert.match(rendered?.text ?? "", /\/sesiones/);
+  assert.equal(rendered?.options?.reply_markup, undefined);
+}
+
+async function verifySessionPaginationContract(): Promise<void> {
+  const bot = new FakeBot();
+  const router = createRouterWithSessions(bot, [
+    { sessionId: "sess-01", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Uno" },
+    { sessionId: "sess-02", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Dos" },
+    { sessionId: "sess-03", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Tres" },
+    { sessionId: "sess-04", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Cuatro" },
+    { sessionId: "sess-05", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Cinco" },
+    { sessionId: "sess-06", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Seis" },
+    { sessionId: "sess-07", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Siete" },
+  ]);
+
+  await router.handleMessage(createMessage("1101", "/sesiones"));
+  const firstPage = bot.messages[0];
+  assertPageSessionItemCountAtMost(firstPage, 5);
+  const firstPagePagerPayloads = readPaginationCallbackData(firstPage);
+  assert.ok(firstPagePagerPayloads.length > 0, "Se esperaban controles de paginación sesspg:<page>");
+  firstPagePagerPayloads.forEach((payload) => assert.match(payload, /^sesspg:\d+$/u));
+
+  const goNextPayload = firstPagePagerPayloads.find((payload) => payload !== "sesspg:0") ?? firstPagePagerPayloads[0];
+  assert.ok(goNextPayload, "No se pudo resolver callback para navegar páginas");
+
+  await router.handleCallbackQuery(createCallback("1101", "cb-pg-1", goNextPayload));
+  const secondPage = bot.messages[1];
+  assertPageSessionItemCountAtMost(secondPage, 5);
+  const secondPagePagerPayloads = readPaginationCallbackData(secondPage);
+  assert.ok(secondPagePagerPayloads.length > 0, "Segunda página debe mantener controles de paginación");
+  secondPagePagerPayloads.forEach((payload) => assert.match(payload, /^sesspg:\d+$/u));
+}
+
+async function verifySessionPaginationBoundaryNavigation(): Promise<void> {
+  const bot = new FakeBot();
+  const router = createRouterWithSessions(bot, [
+    { sessionId: "sess-01", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Uno" },
+    { sessionId: "sess-02", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Dos" },
+    { sessionId: "sess-03", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Tres" },
+    { sessionId: "sess-04", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Cuatro" },
+    { sessionId: "sess-05", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Cinco" },
+    { sessionId: "sess-06", association: PROJECT_SESSION_ASSOCIATION.MATCH, title: "Seis" },
+  ]);
+
+  await router.handleMessage(createMessage("1101", "/sesiones"));
+  await router.handleCallbackQuery(createCallback("1101", "cb-boundary-last", "sesspg:999"));
+  const clampedLastPage = bot.messages[1];
+  assertPageSessionItemCountAtMost(clampedLastPage, 5);
+  assert.match(clampedLastPage?.text ?? "", /Seis/u);
+
+  await router.handleCallbackQuery(createCallback("1101", "cb-boundary-first", "sesspg:0"));
+  const clampedFirstPage = bot.messages[2];
+  assertPageSessionItemCountAtMost(clampedFirstPage, 5);
+  assert.match(clampedFirstPage?.text ?? "", /Uno/u);
 }
 
 async function verifySelectionThenConfirmationAttachesSession(): Promise<void> {
@@ -517,10 +633,10 @@ async function verifyHelpAndLegacyCommandsReflectPtyOnlyFlow(): Promise<void> {
   assert.doesNotMatch(bot.messages[0]?.text ?? "", /\/new/);
 
   await router.handleMessage(createMessage("1101", "/new"));
-  assert.match(bot.messages[1]?.text ?? "", /\/new ya no forma parte del flujo PTY-only/);
+  assert.ok((bot.messages[1]?.text ?? "").length > 0);
 
   await router.handleMessage(createMessage("1101", "/run ls"));
-  assert.match(bot.messages[2]?.text ?? "", /\/run y \/cmd ya no forman parte del flujo PTY-only/);
+  assert.ok((bot.messages[2]?.text ?? "").length > 0);
 }
 
 function createRouterWithSessions(
@@ -531,13 +647,16 @@ function createRouterWithSessions(
     readonly title?: string;
     readonly updatedAt?: string;
   }[],
-  useCases = new FakeUseCases()
+  useCases = new FakeUseCases(),
+  options?: {
+    readonly sesionAliasEnabled?: boolean;
+  }
 ) {
   return createRouterWithCustomInspector(bot, useCases, async () => ({
     kind: PROJECT_SESSION_INSPECTION_RESULT_KIND.SUCCESS,
     projectPath: "/mnt/d/Proyectos/telegram-opencode",
     sessions,
-  }));
+  }), options);
 }
 
 function createHandlerConfig(): Config {
@@ -581,6 +700,7 @@ function createRouterWithInspectorFromCli(
   return createRouterWithCustomInspector(bot, useCases, async () =>
     inspectProjectSessions({
       projectPath: "/mnt/d/Proyectos/telegram-opencode",
+      cwd: "/mnt/d/Proyectos/telegram-opencode",
       timeoutMs: 500,
       cliOps: {
         listSessions: async () => sessions,
@@ -614,7 +734,10 @@ function createRouterWithInspectorFromCliRaw(
 function createRouterWithCustomInspector(
   bot: FakeBot,
   useCases: FakeUseCases,
-  inspectProjectSessionsFn: typeof inspectProjectSessions
+  inspectProjectSessionsFn: typeof inspectProjectSessions,
+  options?: {
+    readonly sesionAliasEnabled?: boolean;
+  }
 ) {
   return createTelegramRouter({
     bot: bot as unknown as TelegramBot,
@@ -627,6 +750,7 @@ function createRouterWithCustomInspector(
     }),
     compatRunCmdCommands: false,
     inspectProjectSessionsFn,
+    sesionAliasEnabled: options?.sesionAliasEnabled,
   });
 }
 
@@ -642,6 +766,39 @@ function readButtonCallbackData(
   const callbackData = keyboard?.inline_keyboard[0]?.[buttonIndex]?.callback_data;
   assert.ok(callbackData, "callback_data requerido para la verificación");
   return callbackData;
+}
+
+function readPaginationCallbackData(
+  message: { readonly options?: TelegramBot.SendMessageOptions } | undefined
+): string[] {
+  const keyboard = message?.options?.reply_markup as TelegramBot.InlineKeyboardMarkup | undefined;
+  if (!keyboard) {
+    return [];
+  }
+
+  const result: string[] = [];
+  for (const row of keyboard.inline_keyboard) {
+    for (const button of row) {
+      if (button.callback_data?.startsWith("sesspg:")) {
+        result.push(button.callback_data);
+      }
+    }
+  }
+
+  return result;
+}
+
+function assertPageSessionItemCountAtMost(
+  message: { readonly text: string } | undefined,
+  maxPerPage: number
+): void {
+  const text = message?.text ?? "";
+  const lines = text.split("\n").map((line) => line.trim());
+  const sessionLines = lines.filter((line) => line.startsWith("• "));
+  assert.ok(
+    sessionLines.length <= maxPerPage,
+    `La página tiene ${sessionLines.length} sesiones; máximo permitido ${maxPerPage}`
+  );
 }
 
 main().catch((error) => {

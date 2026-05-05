@@ -10,7 +10,11 @@ import {
   RECOVERY_REASON,
 } from "../../application/contracts";
 import { PendingPrompt, PENDING_PROMPT_STATUS, PROMPT_TYPE } from "../../domain/entities";
-import { ProjectSessionListItem } from "../../infrastructure/opencode-project-sessions";
+import {
+  PROJECT_SESSION_ASSOCIATION,
+  ProjectSessionInspectionSuccessResult,
+  ProjectSessionListItem,
+} from "../../infrastructure/opencode-project-sessions";
 
 const FALLBACK_ERROR_MESSAGE = "Hubo un problema, probá de nuevo en unos segundos.";
 
@@ -94,7 +98,11 @@ export function formatSessionLinked(sessionId: string, projectId: string): strin
       session: sessionId,
       state: "session-linked",
     },
-    lines: ["Ya podés enviar mensajes a la sesión activa. Para cambiar de sesión, usá /sesiones o repetí /session <otro-id>."],
+    lines: [
+      "Ya podés enviar mensajes a la sesión activa.",
+      "La terminal local se solicita automáticamente para este vínculo.",
+      "Para cambiar de sesión, usá /sesiones o repetí /session <otro-id>.",
+    ],
   });
 }
 
@@ -123,7 +131,7 @@ export function formatNewSessionCreatedConfirmation(sessionId: string, projectId
       session: sessionId,
       state: "session-linked",
     },
-    lines: ["Ya podés enviar mensajes a la sesión activa."],
+    lines: ["Ya podés enviar mensajes a la sesión activa.", "La terminal local se solicita automáticamente para este vínculo."],
   });
 }
 
@@ -181,17 +189,54 @@ export function formatSessionCreated(sessionId: string, projectId: string): stri
   });
 }
 
-export function formatSendSuccess(message: string, needsAttention: boolean): string {
+export interface ExecutionMetadataInput {
+  readonly requestedAgent?: string;
+  readonly requestedModel?: string;
+  readonly effectiveAgent?: string;
+  readonly effectiveModel?: string;
+  readonly modelValidationDegraded?: string;
+}
+
+function formatExecutionMetadataLines(input?: ExecutionMetadataInput): readonly string[] {
+  const lines: string[] = [];
+  lines.push(`🤖 Agente: ${input?.effectiveAgent ?? "no disponible"}`);
+  lines.push(`🧠 Modelo: ${input?.effectiveModel ?? "no disponible"}`);
+
+  if (input?.requestedModel && input.effectiveModel && input.requestedModel !== input.effectiveModel) {
+    lines.push(`ℹ️ Fallback modelo: ${input.requestedModel} → ${input.effectiveModel}`);
+  }
+
+  if (input?.requestedAgent && input.effectiveAgent && input.requestedAgent !== input.effectiveAgent) {
+    lines.push(`ℹ️ Override agente: ${input.requestedAgent} → ${input.effectiveAgent}`);
+  }
+
+  if (input?.modelValidationDegraded) {
+    lines.push(`⚠️ Validación de modelo degradada: ${input.modelValidationDegraded}`);
+  }
+
+  return lines;
+}
+
+export function formatExecutionMetadataBlock(input?: ExecutionMetadataInput): string {
+  return formatExecutionMetadataLines(input).join("\n");
+}
+
+export function formatSendSuccess(message: string, needsAttention: boolean, metadata?: ExecutionMetadataInput): string {
+  const metadataLines = formatExecutionMetadataLines(metadata);
   if (message.trim()) {
     return renderUxBlock({
       semantic: needsAttention ? UX_SEMANTIC.NEEDS_ATTENTION : UX_SEMANTIC.SUCCESS,
       title: needsAttention ? "Respuesta recibida (requiere atención)" : "Respuesta recibida",
-      lines: [message],
+      lines: metadataLines.length > 0 ? [message, ...metadataLines] : [message],
     });
   }
 
   if (needsAttention) {
     return "OpenCode quedó esperando tu respuesta. Revisá /status y seguí por acá.";
+  }
+
+  if (metadataLines.length > 0) {
+    return ["Listo. Tu mensaje fue enviado a la sesión activa.", ...metadataLines].join("\n");
   }
 
   return "Listo. Tu mensaje fue enviado a la sesión activa.";
@@ -274,6 +319,102 @@ export function formatBusyCommandRejected(status: StatusOutput, command: string)
       "Permitidos en busy: /status, /sesiones, /cancel, /project (sin argumentos).",
     ],
   });
+}
+
+export function formatAgentList(agents: readonly string[], activeAgent?: string): string {
+  if (agents.length === 0) {
+    return "No hay agentes disponibles.";
+  }
+
+  const lines = agents.map((agent) => (agent === activeAgent ? `• ✅ ${agent}` : `• ${agent}`));
+  return [
+    activeAgent ? `Agentes disponibles (activo: ${activeAgent}):` : "Agentes disponibles:",
+    "Elegí un botón abajo.",
+    ...lines,
+  ].join("\n");
+}
+
+export function formatModelActive(model: string): string {
+  return `✅ Modelo activo: ${model}`;
+}
+
+export function formatModelActiveWithSessionReconfigured(model: string, attachLocalReopened = false): string {
+  return [
+    formatModelActive(model),
+    attachLocalReopened
+      ? "ℹ️ Reinicié la sesión PTY/tmux y reabrí la terminal local adjunta con el nuevo modelo."
+      : "ℹ️ Reinicié la sesión PTY/tmux para aplicar el modelo. Si tu terminal adjunta se cerró, usá /attach-local para reabrirla.",
+  ].join("\n");
+}
+
+export function formatModelList(models: readonly string[], activeModel?: string): string {
+  if (models.length === 0) {
+    return "No hay modelos disponibles.";
+  }
+
+  const lines = models.map((model) => (model === activeModel ? `• ✅ ${model}` : `• ${model}`));
+  return [
+    activeModel ? `Modelos disponibles (activo: ${activeModel}):` : "Modelos disponibles:",
+    "Elegí un botón abajo.",
+    ...lines,
+  ].join("\n");
+}
+
+export function formatModelUnavailable(reason?: string): string {
+  return `🔴 Catálogo de modelos no disponible${reason ? ` (${reason})` : ""}. Reintentá con /modelos.`;
+}
+
+export function formatModelFallbackNotice(previous: string, next: string): string {
+  return `⚠️ Modelo ${previous} no disponible. Fallback aplicado: ${next}`;
+}
+
+export function formatInvalidModel(): string {
+  return "🔴 Modelo no disponible para este entorno. Usá /modelos.";
+}
+
+export function formatAgentActive(agent: string): string {
+  return [
+    `✅ Agente CONFIGURADO (Telegram): ${agent}`,
+    "⚠️ Cambio manual en OpenCode Console puede generar drift.",
+    "↺ Recomendado: /agente nombre para reaplicar.",
+  ].join("\n");
+}
+
+export function formatAgentActiveWithSessionReconfigured(agent: string, attachLocalReopened = false): string {
+  return [
+    formatAgentActive(agent),
+    attachLocalReopened
+      ? "ℹ️ Reinicié la sesión PTY/tmux y reabrí la terminal local adjunta con el nuevo agente."
+      : "ℹ️ Reinicié la sesión PTY/tmux para aplicar el agente. Si tu terminal adjunta se cerró, usá /attach-local para reabrirla.",
+  ].join("\n");
+}
+
+export function formatAgentSyncNotice(input: {
+  readonly requestedAgent?: string;
+  readonly requestedModel?: string;
+  readonly effectiveAgent?: string;
+  readonly effectiveModel?: string;
+  readonly changed: boolean;
+}): string {
+  const lines = [
+    input.changed ? "↺ Metadata runtime sincronizada" : "ℹ️ Metadata runtime sin cambios",
+    `🤖 Agente: ${input.effectiveAgent ?? "no disponible"}`,
+    `🧠 Modelo: ${input.effectiveModel ?? "no disponible"}`,
+  ];
+
+  if (input.requestedAgent && input.effectiveAgent && input.requestedAgent !== input.effectiveAgent) {
+    lines.push(`ℹ️ Override agente: ${input.requestedAgent} → ${input.effectiveAgent}`);
+  }
+
+  if (input.requestedModel && input.effectiveModel && input.requestedModel !== input.effectiveModel) {
+    lines.push(`ℹ️ Fallback modelo: ${input.requestedModel} → ${input.effectiveModel}`);
+  }
+
+  return lines.join("\n");
+}
+
+export function formatInvalidAgent(agents: readonly string[]): string {
+  return `🔴 Agente no válido. Opciones: ${agents.join(", ")}`;
 }
 
 export function formatRunCommandSuccess(result: RunSessionCommandOutput): string {
@@ -381,8 +522,56 @@ export function formatProjectSessionsEmpty(): string {
   return "ℹ️ No encontré sesiones disponibles para el proyecto actual.";
 }
 
+export function formatProjectSessionsEmptyDebug(input: {
+  readonly activeRootPath: string;
+  readonly inspection: ProjectSessionInspectionSuccessResult;
+}): string {
+  const { activeRootPath, inspection } = input;
+  const counts = inspection.sessions.reduce(
+    (accumulator, session) => {
+      accumulator[session.association] += 1;
+      return accumulator;
+    },
+    {
+      [PROJECT_SESSION_ASSOCIATION.MATCH]: 0,
+      [PROJECT_SESSION_ASSOCIATION.PROJECT_MISMATCH]: 0,
+      [PROJECT_SESSION_ASSOCIATION.UNSAFE]: 0,
+    }
+  );
+
+  const lines = [
+    `rootPath comparado: ${activeRootPath} => ${inspection.projectPath}${activeRootPath === inspection.projectPath ? "" : " (mismatch)"}`,
+    `Total OpenCode: ${inspection.sessions.length}`,
+    `MATCH=${counts[PROJECT_SESSION_ASSOCIATION.MATCH]} PROJECT_MISMATCH=${counts[PROJECT_SESSION_ASSOCIATION.PROJECT_MISMATCH]} UNSAFE=${counts[PROJECT_SESSION_ASSOCIATION.UNSAFE]}`,
+  ];
+
+  const inspectedSessions = inspection.sessions.slice(0, 5);
+  if (inspectedSessions.length > 0) {
+    lines.push(
+      ...inspectedSessions.map(
+        (session) =>
+          `• ${session.sessionId} | ${session.association} | ${session.path ?? "sin path"}`
+      )
+    );
+  }
+
+  return renderUxBlock({
+    semantic: UX_SEMANTIC.INFO,
+    title: "Debug vacío /sesiones",
+    context: {
+      project: inspection.projectPath,
+      state: "empty-filtered",
+    },
+    lines,
+  });
+}
+
 export function formatProjectSessionsReadError(): string {
   return "🔴 No pude consultar las sesiones de OpenCode. Verificá que el bridge PTY y OpenCode estén disponibles.";
+}
+
+export function formatSesionTypoGuidance(): string {
+  return "ℹ️ Comando no disponible: /sesion. Usá /sesiones para listar y elegir una sesión en un solo paso.";
 }
 
 export function formatProjectSessionConfirmation(projectPath: string, sessionId: string): string {
@@ -576,11 +765,18 @@ export function formatAsyncSessionNotice(notice: AsyncSessionNotice): string {
     },
     lines: [
       notice.summary ?? "OpenCode reportó un estado terminal.",
+      `🤖 Agente: ${notice.effectiveAgent ?? "no disponible"}`,
+      `🧠 Modelo: ${notice.effectiveModel ?? "no disponible"}`,
+      ...formatFallbackTransitionLines(notice),
       notice.taskId ? `Task: ${notice.taskId}` : "Task: n/d",
       `Origen: ${notice.terminalSource ?? "desconocido"}`,
       `Causa: ${notice.terminalCause ?? "desconocida"}`,
     ],
   });
+}
+
+function formatFallbackTransitionLines(notice: AsyncSessionNotice): readonly string[] {
+  return formatExecutionMetadataLines(notice).filter((line) => line.startsWith("ℹ️"));
 }
 
 export function formatActiveHumanPrompt(prompt: {
@@ -881,15 +1077,8 @@ export function formatAttachLocalTmuxMissing(input: {
 }
 
 function formatProjectSessionLine(session: ProjectSessionListItem): string {
-  const metadata = [session.title, session.model, session.updatedAt].filter(
-    (value): value is string => typeof value === "string" && value.trim().length > 0
-  );
-
-  if (metadata.length === 0) {
-    return `• ${session.sessionId}`;
-  }
-
-  return `• ${session.sessionId} — ${metadata.join(" • ")}`;
+  const title = session.title?.trim();
+  return `• ${title && title.length > 0 ? title : "Sin título"}`;
 }
 
 export function formatUnknownError(): string {

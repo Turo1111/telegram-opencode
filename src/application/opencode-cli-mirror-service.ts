@@ -5,7 +5,9 @@ import { exportSession, OpenCodeCliMessage, OPEN_CODE_CLI_ROLE } from "../infras
 import { readOpenCodeLocalSessionMessages } from "../infrastructure/opencode-local-store";
 import { OPEN_CODE_ADAPTER_MODE } from "../infrastructure/opencode-adapter-mode";
 import { sendTelegramText, TELEGRAM_CONTENT_KIND } from "../adapters/telegram/message-sender";
+import { formatExecutionMetadataBlock } from "../adapters/telegram/templates";
 import { logger } from "../logger";
+import { syncRuntimeMetadata } from "./runtime-metadata-sync";
 
 export interface OpenCodeCliMirrorServiceDeps {
   readonly config: Config;
@@ -37,6 +39,7 @@ export function createOpenCodeCliMirrorService(deps: OpenCodeCliMirrorServiceDep
 
   const lastSeenAssistantMessageKeyBySession = new Map<string, string>();
   const suppressAssistantTextBySession = new Map<string, string[]>();
+  const rememberedMetadataBySession = new Map<string, { agent?: string; model?: string }>();
 
   return {
     start() {
@@ -150,8 +153,81 @@ export function createOpenCodeCliMirrorService(deps: OpenCodeCliMirrorServiceDep
         contentKind: TELEGRAM_CONTENT_KIND.MODEL,
       });
 
+      const metadata = await resolveSessionMetadata(target, exported.messages);
+      const metadataNotice = formatExecutionMetadataBlock({
+        effectiveAgent: metadata.agent,
+        effectiveModel: metadata.model,
+      });
+      if (metadataNotice.trim()) {
+        await (deps.sendTelegramTextFn ?? sendTelegramText)({
+          bot: deps.bot,
+          chatId: numericChatId,
+          text: metadataNotice,
+          contentKind: TELEGRAM_CONTENT_KIND.TELEGRAM_NATIVE,
+        });
+      }
+
+      const current = rememberedMetadataBySession.get(target.sessionId);
+      if (current?.model && !metadata.model) {
+        metadata.model = current.model;
+      }
+
       lastSeenAssistantMessageKeyBySession.set(target.sessionId, buildMessageKey(message));
     }
+  }
+
+  async function resolveSessionMetadata(
+    target: SessionMirrorTarget,
+    runtimeMessages: readonly OpenCodeCliMessage[]
+  ): Promise<{ agent?: string; model?: string }> {
+    const previous = rememberedMetadataBySession.get(target.sessionId);
+
+    const snapshot = await deps.persistence.runInTransaction(async (unit) => {
+      const persisted = await unit.sessions.findById(target.sessionId);
+      if (!persisted) {
+        return { persisted: undefined, configuredAgent: undefined };
+      }
+
+      const configuredAgent = unit.agentSelections
+        ? normalizeMetaString(
+            (
+              await unit.agentSelections.findByChatAndProject(target.chatId, persisted.projectId)
+            )?.activeAgent
+          )
+        : undefined;
+
+      return { persisted, configuredAgent };
+    });
+
+    const synced = await syncRuntimeMetadata({
+      persistence: deps.persistence,
+      chatId: target.chatId,
+      projectId: snapshot.persisted?.projectId ?? "",
+      sessionId: target.sessionId,
+      nowIso: new Date().toISOString(),
+      readRuntimeMessages: async () => runtimeMessages,
+      fallback: {
+        requestedAgent: snapshot.persisted?.requestedAgent,
+        requestedModel: snapshot.persisted?.requestedModel,
+        effectiveAgent: snapshot.persisted?.effectiveAgent,
+        effectiveModel: snapshot.persisted?.effectiveModel,
+      },
+    });
+
+    const detectedAgent =
+      normalizeMetaString(synced.effectiveAgent) ??
+      normalizeMetaString(snapshot.persisted?.requestedAgent);
+    const detectedModel =
+      normalizeMetaString(synced.effectiveModel) ??
+      normalizeMetaString(snapshot.persisted?.requestedModel);
+
+    const next = {
+      agent: detectedAgent ?? previous?.agent ?? snapshot.configuredAgent,
+      model: detectedModel ?? previous?.model,
+    };
+
+    rememberedMetadataBySession.set(target.sessionId, next);
+    return next;
   }
 
   async function loadSessionMessages(sessionId: string) {
@@ -202,7 +278,22 @@ export function createOpenCodeCliMirrorService(deps: OpenCodeCliMirrorServiceDep
         suppressAssistantTextBySession.delete(sessionId);
       }
     }
+
+    for (const sessionId of rememberedMetadataBySession.keys()) {
+      if (!activeSessionIds.has(sessionId)) {
+        rememberedMetadataBySession.delete(sessionId);
+      }
+    }
   }
+}
+
+function normalizeMetaString(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 function isLocalCliLikeMode(config: Config): boolean {

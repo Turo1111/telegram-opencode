@@ -4,6 +4,7 @@ import {
   OpenCodeAdapterMode,
   parseOpenCodeAdapterMode,
 } from "./infrastructure/opencode-adapter-mode";
+import { isSupportedAgent, SUPPORTED_AGENTS, SupportedAgent } from "./domain/entities";
 
 dotenv.config();
 
@@ -12,6 +13,7 @@ export interface Config {
   allowedUserIds: readonly string[];
   openCodeUrl: string;
   openCodeToken: string;
+  openCodeDefaultAgent?: SupportedAgent;
   openCodeAdapter?: OpenCodeAdapterMode;
   openCodeTimeoutMs: number;
   openCodeControlTimeoutMs: number;
@@ -40,6 +42,19 @@ export interface Config {
   attachLocalEnabled?: boolean;
   localHostConfirmationTtlMs?: number;
   localTerminalLaunchTimeoutMs?: number;
+}
+
+function parseDefaultAgent(): SupportedAgent {
+  const raw = (process.env.OPEN_CODE_DEFAULT_AGENT || "").trim();
+  if (!raw) {
+    return SUPPORTED_AGENTS.BUILD;
+  }
+
+  if (!isSupportedAgent(raw)) {
+    return SUPPORTED_AGENTS.BUILD;
+  }
+
+  return raw;
 }
 
 export const STATE_DRIVERS = {
@@ -236,6 +251,7 @@ export function loadConfig(): Config {
     allowedUserIds,
     openCodeUrl,
     openCodeToken,
+    openCodeDefaultAgent: parseDefaultAgent(),
     openCodeAdapter,
     openCodeTimeoutMs,
     openCodeControlTimeoutMs: parseNumber("OPEN_CODE_CONTROL_TIMEOUT_MS", openCodeTimeoutMs),

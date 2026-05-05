@@ -30,11 +30,13 @@ export function createLocalTerminalLauncher(options: LocalTerminalLauncherOption
     async launchAttach(input) {
       const manualCommand = `wsl.exe bash -lc 'tmux attach -t ${input.tmuxSessionName}'`;
 
+      await closeExistingAttachProcesses(input.tmuxSessionName, timeoutMs, platform);
+
       const wtExists = await canExec("where.exe", ["wt.exe"], timeoutMs);
       if (wtExists) {
         const wtLaunched = await canExec(
           "wt.exe",
-          ["new-tab", "wsl.exe", "bash", "-lc", `tmux attach -t ${input.tmuxSessionName}`],
+          ["new-tab", "--title", input.tmuxSessionName, "wsl.exe", "bash", "-lc", `tmux attach -t ${input.tmuxSessionName}`],
           timeoutMs
         );
         if (wtLaunched) {
@@ -104,4 +106,24 @@ async function canExec(command: string, args: readonly string[], timeoutMs: numb
       resolve(false);
     });
   });
+}
+
+async function closeExistingAttachProcesses(sessionName: string, timeoutMs: number, platform: NodeJS.Platform): Promise<void> {
+  if (platform !== "win32") {
+    return;
+  }
+
+  const powershellAvailable = await canExec("powershell.exe", ["-NoProfile", "-Command", "$PSVersionTable.PSVersion"], timeoutMs);
+  if (!powershellAvailable) {
+    return;
+  }
+
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$titlePattern = '*--title ${sessionName}*'`,
+    `$attachPattern = '*tmux attach -t ${sessionName}*'`,
+    "Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'wt.exe' -and $_.CommandLine -like $titlePattern) -or ($_.CommandLine -like $attachPattern) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+  ].join('; ');
+
+  await canExec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], timeoutMs);
 }

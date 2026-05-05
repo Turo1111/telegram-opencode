@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   ActiveTaskRepository,
+  AgentSelectionRepository,
+  ModelSelectionRepository,
   BindingRepository,
   DangerousActionConfirmationRepository,
   PendingPromptRepository,
@@ -16,6 +18,8 @@ import {
 import { Config } from "../../config";
 import {
   ActiveTask,
+  AgentSelection,
+  ModelSelection,
   ChatBinding,
   DangerousActionConfirmation,
   OperationalState,
@@ -32,6 +36,8 @@ interface JsonStoreData {
   bindings: Record<string, ChatBinding>;
   states: Record<string, OperationalState>;
   tasks: Record<string, ActiveTask>;
+  agentSelections: Record<string, AgentSelection>;
+  modelSelections: Record<string, ModelSelection>;
   pendingPrompts: Record<string, PendingPrompt>;
   dangerousActionConfirmations: Record<string, DangerousActionConfirmation>;
 }
@@ -42,6 +48,8 @@ const EMPTY_STORE: JsonStoreData = {
   bindings: {},
   states: {},
   tasks: {},
+  agentSelections: {},
+  modelSelections: {},
   pendingPrompts: {},
   dangerousActionConfirmations: {},
 };
@@ -168,6 +176,8 @@ function sanitizeStore(value: unknown): JsonStoreData {
     bindings: sanitizeRecord<ChatBinding>(candidate.bindings),
     states: sanitizeStateRecord(candidate.states),
     tasks: sanitizeRecord<ActiveTask>(candidate.tasks),
+    agentSelections: sanitizeRecord<AgentSelection>(candidate.agentSelections),
+    modelSelections: sanitizeRecord<ModelSelection>(candidate.modelSelections),
     pendingPrompts: sanitizePendingPromptRecord(candidate.pendingPrompts),
     dangerousActionConfirmations: sanitizeDangerousActionConfirmationRecord(
       candidate.dangerousActionConfirmations
@@ -271,6 +281,10 @@ function normalizeSession(session: Session): Session {
       typeof session.watchdogRetryCount === "number" && Number.isFinite(session.watchdogRetryCount)
         ? session.watchdogRetryCount
         : undefined,
+    requestedAgent: typeof session.requestedAgent === "string" ? session.requestedAgent : undefined,
+    requestedModel: typeof session.requestedModel === "string" ? session.requestedModel : undefined,
+    effectiveAgent: typeof session.effectiveAgent === "string" ? session.effectiveAgent : undefined,
+    effectiveModel: typeof session.effectiveModel === "string" ? session.effectiveModel : undefined,
   };
 }
 
@@ -321,6 +335,8 @@ function cloneData(data: JsonStoreData): JsonStoreData {
     bindings: { ...data.bindings },
     states: { ...data.states },
     tasks: { ...data.tasks },
+    agentSelections: { ...data.agentSelections },
+    modelSelections: { ...data.modelSelections },
     pendingPrompts: { ...data.pendingPrompts },
     dangerousActionConfirmations: { ...data.dangerousActionConfirmations },
   };
@@ -346,10 +362,48 @@ function createJsonUnit(data: JsonStoreData): PersistenceUnit {
   const bindings = createBindingRepository(data);
   const states = createStateRepository(data);
   const tasks = createActiveTaskRepository(data);
+  const agentSelections = createAgentSelectionRepository(data);
+  const modelSelections = createModelSelectionRepository(data);
   const pendingPrompts = createPendingPromptRepository(data);
   const dangerousActionConfirmations = createDangerousActionConfirmationRepository(data);
 
-  return { projects, sessions, bindings, states, tasks, pendingPrompts, dangerousActionConfirmations };
+  return {
+    projects,
+    sessions,
+    bindings,
+    states,
+    tasks,
+    agentSelections,
+    modelSelections,
+    pendingPrompts,
+    dangerousActionConfirmations,
+  };
+}
+
+function selectionKey(chatId: string, projectId: string): string {
+  return `${chatId}::${projectId}`;
+}
+
+function createAgentSelectionRepository(data: JsonStoreData): AgentSelectionRepository {
+  return {
+    async findByChatAndProject(chatId, projectId) {
+      return data.agentSelections[selectionKey(chatId, projectId)];
+    },
+    async upsert(selection) {
+      data.agentSelections[selectionKey(selection.chatId, selection.projectId)] = { ...selection };
+    },
+  };
+}
+
+function createModelSelectionRepository(data: JsonStoreData): ModelSelectionRepository {
+  return {
+    async findByChatAndProject(chatId, projectId) {
+      return data.modelSelections[selectionKey(chatId, projectId)];
+    },
+    async upsert(selection) {
+      data.modelSelections[selectionKey(selection.chatId, selection.projectId)] = { ...selection };
+    },
+  };
 }
 
 function createProjectRepository(data: JsonStoreData): ProjectRepository {

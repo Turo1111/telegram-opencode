@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { SupportedAgent } from "../domain/entities";
 
 export const OPEN_CODE_CLI_ROLE = {
   ASSISTANT: "assistant",
@@ -18,11 +19,23 @@ export interface OpenCodeCliSessionListItem {
   readonly updatedAt?: string;
 }
 
+
+export interface OpenCodeCliModelItem {
+  readonly id: string;
+  readonly label?: string;
+}
 export interface OpenCodeCliMessage {
   readonly id: string;
   readonly role: OpenCodeCliRole;
   readonly text: string;
   readonly createdAt?: string;
+  readonly info?: {
+    readonly agent?: string;
+    readonly model?: {
+      readonly providerID?: string;
+      readonly modelID?: string;
+    };
+  };
 }
 
 export interface OpenCodeCliExport {
@@ -87,13 +100,38 @@ export async function resolveCanonicalProjectPath(rootPath: string): Promise<str
   return fs.realpath(absolutePath);
 }
 
-export async function listSessions(timeoutMs: number): Promise<readonly OpenCodeCliSessionListItem[]> {
+export async function listSessions(
+  timeoutMs: number,
+  cwd?: string
+): Promise<readonly OpenCodeCliSessionListItem[]> {
+  traceSessionsDebug("cli:listSessions:start", { timeoutMs });
   const result = await runOpenCodeCli({
     args: ["session", "list", "--format", "json"],
+    cwd,
     timeoutMs,
   });
 
-   return parseOpenCodeCliSessionList(result.stdout);
+  traceSessionsDebug("cli:listSessions:stdout", { raw: result.stdout.slice(0, 1200) });
+  const parsed = parseOpenCodeCliSessionList(result.stdout);
+  traceSessionsDebug("cli:listSessions:parsed", {
+    total: parsed.length,
+    sessions: parsed.slice(0, 5).map((session) => ({
+      id: session.id,
+      path: session.path,
+      title: session.title,
+      updatedAt: session.updatedAt,
+    })),
+  });
+  return parsed;
+}
+
+export async function listModels(timeoutMs: number): Promise<readonly OpenCodeCliModelItem[]> {
+  const result = await runOpenCodeCli({
+    args: ["models"],
+    timeoutMs,
+  });
+
+  return parseOpenCodeCliModelList(result.stdout);
 }
 
 export async function runSessionMessage(input: {
@@ -101,6 +139,8 @@ export async function runSessionMessage(input: {
   readonly dir: string;
   readonly message: string;
   readonly timeoutMs: number;
+  readonly agent?: SupportedAgent;
+  readonly model?: string;
 }): Promise<{ readonly replyText: string }> {
   const result = await runOpenCodeCli({
     args: buildRunSessionArgs(input),
@@ -115,6 +155,8 @@ export async function startSessionMessage(input: {
   readonly sessionId: string;
   readonly dir: string;
   readonly message: string;
+  readonly agent?: SupportedAgent;
+  readonly model?: string;
 }): Promise<void> {
   await spawnOpenCodeCli({
     args: buildRunSessionArgs(input),
@@ -308,6 +350,14 @@ function parseJson(raw: string, operation: string): unknown {
   }
 }
 
+function traceSessionsDebug(label: string, payload: unknown): void {
+  if (process.env.TGOC_TRACE_SESSIONS !== "1") {
+    return;
+  }
+
+  console.log(`[tgoc/sesiones] ${label}`, payload);
+}
+
 function normalizeJsonPayload(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -331,12 +381,78 @@ function normalizeJsonPayload(raw: string): string {
   return lines.slice(firstJsonLine).join("\n").trim();
 }
 
-function buildRunSessionArgs(input: {
+export function buildRunSessionArgs(input: {
   readonly sessionId: string;
   readonly dir: string;
   readonly message: string;
+  readonly agent?: SupportedAgent;
+  readonly model?: string;
 }): readonly string[] {
-  return ["run", "--format", "json", "--session", input.sessionId, "--dir", input.dir, input.message];
+  const args = ["run", "--format", "json", "--session", input.sessionId, "--dir", input.dir];
+  if (input.agent) {
+    args.push("--agent", input.agent);
+  }
+  if (input.model) {
+    args.push("--model", input.model);
+  }
+  args.push(input.message);
+  return args;
+}
+
+export function parseOpenCodeCliModelList(raw: string): readonly OpenCodeCliModelItem[] {
+  const itemsFromJson = tryParseModelListJson(raw);
+  if (itemsFromJson.length > 0) {
+    return itemsFromJson;
+  }
+
+  const lines = raw
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  const items: OpenCodeCliModelItem[] = [];
+  for (const line of lines) {
+    if (
+      line.startsWith("opencode ") ||
+      line.startsWith("Commands:") ||
+      line.startsWith("Positionals:") ||
+      line.startsWith("Options:") ||
+      line.startsWith("provider") ||
+      line.startsWith("-")
+    ) {
+      continue;
+    }
+
+    if (!line.includes("/")) {
+      continue;
+    }
+
+    items.push({ id: line });
+  }
+
+  return items;
+}
+
+function tryParseModelListJson(raw: string): readonly OpenCodeCliModelItem[] {
+  try {
+    const parsed = parseJson(raw, "models");
+    const rawItems = Array.isArray(parsed)
+      ? parsed
+      : isRecord(parsed) && Array.isArray(parsed.items)
+        ? parsed.items
+        : [];
+
+    const items: OpenCodeCliModelItem[] = [];
+    for (const item of rawItems) {
+      if (!isRecord(item)) continue;
+      const id = readString(item.id) ?? readString(item.model) ?? readString(item.name);
+      if (!id) continue;
+      items.push({ id, label: readString(item.label) ?? readString(item.title) });
+    }
+    return items;
+  } catch {
+    return [];
+  }
 }
 
 async function spawnOpenCodeCli(input: {
@@ -438,6 +554,17 @@ function extractMessages(value: unknown): readonly OpenCodeCliMessage[] {
         readTimestamp(raw.created_at) ??
         readTimestamp(infoTime?.created) ??
         readTimestamp(infoTime?.completed),
+      info: {
+        agent: readString(info?.agent),
+        model: {
+          providerID:
+            readString((info?.model as Record<string, unknown> | undefined)?.providerID) ??
+            readString((info?.model as Record<string, unknown> | undefined)?.provider_id),
+          modelID:
+            readString((info?.model as Record<string, unknown> | undefined)?.modelID) ??
+            readString((info?.model as Record<string, unknown> | undefined)?.model_id),
+        },
+      },
     });
   }
 

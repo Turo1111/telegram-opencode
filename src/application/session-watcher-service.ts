@@ -29,6 +29,8 @@ import { ERROR_CODES } from "../domain/errors";
 import { completeTaskIfExists, resolveStableSessionMode } from "./boot-recovery-service";
 import type { ReceiverHandlerResult } from "../infrastructure/http/session-webhook-receiver";
 import { logger } from "../logger";
+import { syncRuntimeMetadata } from "./runtime-metadata-sync";
+import { OpenCodeCliMessage } from "../infrastructure/opencode-cli";
 
 export interface SessionWatcherServiceDeps {
   readonly config: Config;
@@ -36,12 +38,14 @@ export interface SessionWatcherServiceDeps {
   readonly adapter: OpenCodeSessionAdapter;
   readonly notify: (notice: AsyncSessionNotice) => Promise<void>;
   readonly callbackUrl: string;
+  readonly readRuntimeMessages?: (sessionId: string) => Promise<readonly OpenCodeCliMessage[]>;
 }
 
 export interface SessionWatcherService {
   createRegistration(): SessionWatcherRegistration;
   handleIncomingEvent(auth: WebhookAuthContext, event: SessionEvent): Promise<ReceiverHandlerResult>;
   runWatchdogSweep(nowIso?: string): Promise<void>;
+  runDriftPoll?(nowIso?: string): Promise<void>;
   restoreAfterRestart(nowIso?: string): Promise<void>;
   startScheduler(): void;
   stopScheduler(): void;
@@ -49,6 +53,7 @@ export interface SessionWatcherService {
 
 export function createSessionWatcherService(deps: SessionWatcherServiceDeps): SessionWatcherService {
   let timer: NodeJS.Timeout | undefined;
+  let driftTimer: NodeJS.Timeout | undefined;
   const chatQueue = new Map<string, Promise<void>>();
 
   async function findBindingBySessionId(sessionId: string): Promise<{ chatId: string } | undefined> {
@@ -155,6 +160,14 @@ export function createSessionWatcherService(deps: SessionWatcherServiceDeps): Se
         });
       }
     },
+    async runDriftPoll(nowIso = new Date().toISOString()) {
+      const candidates = await listDriftCandidates(deps.persistence, nowIso, deps.config.watchdogStaleAfterMs);
+      for (const candidate of candidates) {
+        await enqueueByChat(chatQueue, candidate.chatId, async () => {
+          await pollSessionMetadata(deps, candidate, nowIso);
+        });
+      }
+    },
     async restoreAfterRestart(nowIso = new Date().toISOString()) {
       const notices = await deps.persistence.runInTransaction(async (unit) => {
         const [bindings, sessions] = await Promise.all([unit.bindings.listAll(), unit.sessions.listAll()]);
@@ -203,7 +216,7 @@ export function createSessionWatcherService(deps: SessionWatcherServiceDeps): Se
       }
     },
     startScheduler() {
-      if (!deps.config.watchdogEnabled || timer) {
+      if (timer || driftTimer) {
         return;
       }
 
@@ -214,14 +227,29 @@ export function createSessionWatcherService(deps: SessionWatcherServiceDeps): Se
           });
         });
       }, deps.config.watchdogIntervalMs);
+
+      driftTimer = setInterval(() => {
+        if (!this.runDriftPoll) {
+          return;
+        }
+
+        void this.runDriftPoll().catch((error) => {
+          logger.error("Drift poll failed", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }, Math.max(1500, deps.config.pollingIntervalMs));
     },
     stopScheduler() {
-      if (!timer) {
-        return;
+      if (timer) {
+        clearInterval(timer);
+        timer = undefined;
       }
 
-      clearInterval(timer);
-      timer = undefined;
+      if (driftTimer) {
+        clearInterval(driftTimer);
+        driftTimer = undefined;
+      }
     },
   };
 
@@ -464,6 +492,13 @@ export function createSessionWatcherService(deps: SessionWatcherServiceDeps): Se
           activeTaskId: undefined,
           updatedAt: event.occurredAt,
         });
+        const metadata = resolveTerminalMetadata(event.data, {
+          requestedAgent: session.requestedAgent,
+          requestedModel: session.requestedModel,
+          effectiveAgent: session.effectiveAgent,
+          effectiveModel: session.effectiveModel,
+        });
+
         await unit.sessions.upsert({
           ...session,
           watcherToken: source === TERMINAL_EVENT_SOURCE.WEBHOOK ? undefined : session.watcherToken,
@@ -474,6 +509,10 @@ export function createSessionWatcherService(deps: SessionWatcherServiceDeps): Se
           notificationSentAt: event.occurredAt,
           updatedAt: event.occurredAt,
           watchdogRetryCount: 0,
+          requestedAgent: metadata.requestedAgent,
+          requestedModel: metadata.requestedModel,
+          effectiveAgent: metadata.effectiveAgent,
+          effectiveModel: metadata.effectiveModel,
         });
 
         return {
@@ -486,11 +525,16 @@ export function createSessionWatcherService(deps: SessionWatcherServiceDeps): Se
             sessionId: session.sessionId,
             taskId,
             terminalCause: resolveTerminalCause(event, source),
-              terminalSource: source,
-              summary: readSummary(event.data),
-              promptCleanup,
-            } satisfies AsyncSessionNotice,
-          } as const;
+            terminalSource: source,
+            summary: readSummary(event.data),
+            requestedAgent: metadata.requestedAgent,
+            requestedModel: metadata.requestedModel,
+            effectiveAgent: metadata.effectiveAgent,
+            effectiveModel: metadata.effectiveModel,
+            fallbackInfo: metadata.fallbackInfo,
+            promptCleanup,
+          } satisfies AsyncSessionNotice,
+        } as const;
       });
 
       if (notice.accepted && "notice" in notice && notice.notice) {
@@ -851,6 +895,130 @@ function readSummary(data: Readonly<Record<string, unknown>> | undefined): strin
 
   const summary = data.summary;
   return typeof summary === "string" && summary.trim() ? summary : undefined;
+}
+
+function resolveTerminalMetadata(
+  data: Readonly<Record<string, unknown>> | undefined,
+  previous: {
+    readonly requestedAgent?: string;
+    readonly requestedModel?: string;
+    readonly effectiveAgent?: string;
+    readonly effectiveModel?: string;
+  }
+): {
+  readonly requestedAgent?: string;
+  readonly requestedModel?: string;
+  readonly effectiveAgent?: string;
+  readonly effectiveModel?: string;
+  readonly fallbackInfo?: {
+    readonly kind: "model-fallback" | "agent-override" | "multiple";
+    readonly requestedAgent?: string;
+    readonly effectiveAgent?: string;
+    readonly requestedModel?: string;
+    readonly effectiveModel?: string;
+  };
+} {
+  const requestedAgent = readString(data?.requestedAgent) ?? readString(data?.requested_agent) ?? previous.requestedAgent;
+  const requestedModel = readString(data?.requestedModel) ?? readString(data?.requested_model) ?? previous.requestedModel;
+  const effectiveAgent =
+    readString(data?.effectiveAgent) ?? readString(data?.effective_agent) ?? previous.effectiveAgent ?? requestedAgent;
+  const effectiveModel = readString(data?.effectiveModel) ?? readString(data?.effective_model) ?? previous.effectiveModel;
+
+  const hasAgentDrift = !!requestedAgent && !!effectiveAgent && requestedAgent !== effectiveAgent;
+  const hasModelDrift = !!requestedModel && !!effectiveModel && requestedModel !== effectiveModel;
+
+  return {
+    requestedAgent,
+    requestedModel,
+    effectiveAgent,
+    effectiveModel,
+    fallbackInfo:
+      hasAgentDrift || hasModelDrift
+        ? {
+            kind: hasAgentDrift && hasModelDrift ? "multiple" : hasModelDrift ? "model-fallback" : "agent-override",
+            requestedAgent,
+            effectiveAgent,
+            requestedModel,
+            effectiveModel,
+          }
+        : undefined,
+  };
+}
+
+
+async function listDriftCandidates(
+  persistence: PersistenceDriver,
+  nowIso: string,
+  staleAfterMs: number
+): Promise<readonly WatchdogCandidate[]> {
+  return listWatchdogCandidates(persistence, nowIso, staleAfterMs);
+}
+
+function mergeSessionMetadata(
+  session: {
+    readonly sessionId: string;
+    readonly projectId: string;
+    readonly createdAt: string;
+    readonly updatedAt?: string;
+    readonly requestedAgent?: string;
+    readonly requestedModel?: string;
+    readonly effectiveAgent?: string;
+    readonly effectiveModel?: string;
+  },
+  state: { requestedAgent?: string; requestedModel?: string; effectiveAgent?: string; effectiveModel?: string }
+): {
+  readonly sessionId: string;
+  readonly projectId: string;
+  readonly createdAt: string;
+  readonly updatedAt?: string;
+  readonly requestedAgent?: string;
+  readonly requestedModel?: string;
+  readonly effectiveAgent?: string;
+  readonly effectiveModel?: string;
+} {
+  return {
+    ...session,
+    requestedAgent: state.requestedAgent ?? session.requestedAgent,
+    requestedModel: state.requestedModel ?? session.requestedModel,
+    effectiveAgent: state.effectiveAgent ?? session.effectiveAgent ?? state.requestedAgent ?? session.requestedAgent,
+    effectiveModel: state.effectiveModel ?? session.effectiveModel ?? session.requestedModel,
+  };
+}
+
+function hasSessionMetadataChanged(
+  before: { readonly requestedAgent?: string; readonly requestedModel?: string; readonly effectiveAgent?: string; readonly effectiveModel?: string },
+  after: { readonly requestedAgent?: string; readonly requestedModel?: string; readonly effectiveAgent?: string; readonly effectiveModel?: string }
+): boolean {
+  return before.requestedAgent !== after.requestedAgent || before.requestedModel !== after.requestedModel || before.effectiveAgent !== after.effectiveAgent || before.effectiveModel !== after.effectiveModel;
+}
+
+async function pollSessionMetadata(
+  deps: SessionWatcherServiceDeps,
+  candidate: WatchdogCandidate,
+  nowIso: string
+): Promise<void> {
+  const synced = await syncRuntimeMetadata({
+    persistence: deps.persistence,
+    chatId: candidate.chatId,
+    projectId: candidate.projectId,
+    sessionId: candidate.sessionId,
+    nowIso,
+    readRuntimeMessages: deps.readRuntimeMessages,
+  });
+  if (!synced.changed) return;
+  await deps.notify({
+    chatId: candidate.chatId,
+    kind: ASYNC_SESSION_NOTICE_KIND.TERMINAL,
+    projectId: candidate.projectId,
+    sessionId: candidate.sessionId,
+    summary: 'Drift detectado: Telegram refrescó metadata runtime.',
+    terminalSource: TERMINAL_EVENT_SOURCE.WATCHDOG,
+    terminalCause: 'metadata-sync',
+    requestedAgent: synced.requestedAgent,
+    requestedModel: synced.requestedModel,
+    effectiveAgent: synced.effectiveAgent,
+    effectiveModel: synced.effectiveModel,
+  });
 }
 
 function isTerminalEvent(kind: SessionEvent["kind"]): boolean {

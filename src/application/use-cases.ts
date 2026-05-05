@@ -26,6 +26,8 @@ import {
   ACTIVE_TASK_STATUS,
   ATTACH_LOCAL_EXECUTION_RESULT,
   ActiveTask,
+  AgentSelection,
+  ModelSelection,
   ChatBinding,
   DANGEROUS_ACTION_CONFIRMATION_STATUS,
   LOCAL_TERMINAL_LAUNCHER,
@@ -37,12 +39,18 @@ import {
   PendingPrompt,
   Project,
   Session,
+  SUPPORTED_AGENTS,
+  SupportedAgent,
+  isSupportedAgent,
   applyProjectSelection,
   assertNoActiveTaskConflict,
   createIdleState,
 } from "../domain/entities";
+import { toTmuxSessionName } from "../infrastructure/opencode-tmux-host";
 import { DomainError, ERROR_CODES, asDomainError } from "../domain/errors";
 import { logger } from "../logger";
+import { syncRuntimeMetadata } from "./runtime-metadata-sync";
+import { OpenCodeCliMessage } from "../infrastructure/opencode-cli";
 
 export interface SelectProjectInput {
   chatId: string;
@@ -98,6 +106,11 @@ export interface SendTextOutput {
   needsAttention: boolean;
   status?: RemoteSessionStatus;
   state: SessionState;
+  requestedAgent?: string;
+  requestedModel?: string;
+  effectiveAgent?: string;
+  effectiveModel?: string;
+  modelValidationDegraded?: string;
 }
 
 export interface RunSessionCommandOutput {
@@ -110,6 +123,11 @@ export interface RunSessionCommandOutput {
   status?: RemoteSessionStatus;
   state: SessionState;
   warning?: string;
+  requestedAgent?: string;
+  requestedModel?: string;
+  effectiveAgent?: string;
+  effectiveModel?: string;
+  modelValidationDegraded?: string;
 }
 
 export interface StatusOutput {
@@ -123,6 +141,22 @@ export interface StatusOutput {
   lastReconciledAt?: string;
   lastErrorCode?: string;
   lastErrorMessage?: string;
+}
+
+export interface SessionMetadataSyncOutput {
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly changed: boolean;
+  readonly requestedAgent?: string;
+  readonly requestedModel?: string;
+  readonly effectiveAgent?: string;
+  readonly effectiveModel?: string;
+}
+
+export interface SetActiveAgentOutput {
+  readonly activeAgent: SupportedAgent;
+  readonly sessionReconfigured: boolean;
+  readonly attachLocalReopened?: boolean;
 }
 
 export interface CancelSessionInput {
@@ -181,6 +215,13 @@ export interface ApplicationUseCases {
   submitPendingPrompt(input: SubmitPendingPromptInput): Promise<Result<SubmitPendingPromptOutput>>;
   cancelSession(input: CancelSessionInput): Promise<Result<CancelSessionOutput>>;
   getStatus(chatId: string): Promise<Result<StatusOutput>>;
+  refreshSessionMetadata?(chatId: string): Promise<Result<SessionMetadataSyncOutput>>;
+  listSupportedAgents?(): Promise<readonly SupportedAgent[]>;
+  getActiveAgent?(chatId: string): Promise<Result<SupportedAgent>>;
+  setActiveAgent?(input: { chatId: string; agent: string }): Promise<Result<SetActiveAgentOutput>>;
+  listAvailableModels?(chatId: string): Promise<Result<{ activeModel?: string; models: readonly string[]; degraded?: string }>>;
+  getActiveModel?(chatId: string): Promise<Result<string>>;
+  setActiveModel?(input: { chatId: string; model: string }): Promise<Result<{ activeModel: string; sessionReconfigured: boolean; attachLocalReopened?: boolean }>>;
 }
 
 export interface ConfirmDangerousActionInput {
@@ -248,6 +289,8 @@ interface CreateApplicationUseCasesDeps {
     readonly opencodeSessionId: string;
     readonly timeoutMs: number;
   }) => Promise<{ readonly exists: boolean; readonly tmuxSessionName: string }>;
+  openCodeDefaultAgent?: SupportedAgent;
+  readRuntimeMessages?: (sessionId: string) => Promise<readonly OpenCodeCliMessage[]>;
 }
 
 export interface BootRecoverResult {
@@ -280,6 +323,164 @@ export function createApplicationUseCases(
     : undefined;
 
   return {
+    async listSupportedAgents() {
+      return [
+        SUPPORTED_AGENTS.BUILD,
+        SUPPORTED_AGENTS.PLAN,
+        SUPPORTED_AGENTS.GENTLEMAN,
+        SUPPORTED_AGENTS.SDD_ORCHESTRATOR,
+      ] as const;
+    },
+
+    async getActiveAgent(chatId) {
+      const nowIso = new Date().toISOString();
+      const context = await deps.persistence.runInTransaction((unit) => loadChatRuntimeContext(unit, chatId, nowIso));
+      if (!context.binding.activeProjectId) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Primero elegí un proyecto con /project");
+      }
+
+      const effectiveAgent = await resolveEffectiveAgent(
+        deps.persistence,
+        chatId,
+        context.binding.activeProjectId,
+        deps.openCodeDefaultAgent
+      );
+      return okResult(effectiveAgent);
+    },
+
+    async setActiveAgent(input) {
+      const agent = normalizeAgentSelectionInput(input.agent);
+      if (!isSupportedAgent(agent)) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Agente no válido");
+      }
+
+      const nowIso = new Date().toISOString();
+      const context = await deps.persistence.runInTransaction((unit) => loadChatRuntimeContext(unit, input.chatId, nowIso));
+      if (!context.binding.activeProjectId) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Primero elegí un proyecto con /project");
+      }
+
+      await deps.persistence.runInTransaction(async (unit) => {
+        const repository = unit.agentSelections;
+        if (!repository) {
+          throw new DomainError(ERROR_CODES.PERSISTENCE_ERROR, "Repositorio de selección de agente no disponible");
+        }
+        const selection: AgentSelection = {
+          chatId: input.chatId,
+          projectId: context.binding.activeProjectId!,
+          activeAgent: agent,
+          updatedAt: nowIso,
+        };
+        await repository.upsert(selection);
+      });
+
+      let sessionReconfigured = false;
+      if (context.binding.activeSessionId && deps.adapter.configureSessionAgent) {
+        const configured = await deps.adapter.configureSessionAgent({
+          projectId: context.binding.activeProjectId,
+          sessionId: context.binding.activeSessionId,
+          agent,
+        });
+        if (!configured.ok) {
+          return configured;
+        }
+        sessionReconfigured = true;
+      }
+
+      const attachLocalReopened = await reopenAttachLocalIfNeeded({
+        localTerminalLauncher: deps.localTerminalLauncher,
+        persistence: deps.persistence,
+        chatId: input.chatId,
+        projectId: context.binding.activeProjectId,
+        sessionId: context.binding.activeSessionId,
+        sessionReconfigured,
+      });
+
+      return okResult({
+        activeAgent: agent,
+        sessionReconfigured,
+        ...(attachLocalReopened ? { attachLocalReopened } : {}),
+      });
+    },
+
+    async listAvailableModels(chatId) {
+      const nowIso = new Date().toISOString();
+      const context = await deps.persistence.runInTransaction((unit) => loadChatRuntimeContext(unit, chatId, nowIso));
+      if (!context.binding.activeProjectId) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Primero elegí un proyecto con /project");
+      }
+      if (!deps.adapter.listModels) {
+        return okResult({ activeModel: undefined, models: [], degraded: "unsupported" });
+      }
+      const catalog = await deps.adapter.listModels({
+        chatId,
+        projectId: context.binding.activeProjectId,
+        sessionId: context.binding.activeSessionId,
+      });
+      if (!catalog.ok) return catalog;
+      const active = await resolveEffectiveModel(deps.persistence, deps.adapter, chatId, context.binding.activeProjectId, context.binding.activeSessionId);
+      return okResult({ activeModel: active.effectiveModel, models: catalog.value.models.map((m) => m.id), degraded: catalog.value.degraded?.reason });
+    },
+
+    async getActiveModel(chatId) {
+      const nowIso = new Date().toISOString();
+      const context = await deps.persistence.runInTransaction((unit) => loadChatRuntimeContext(unit, chatId, nowIso));
+      if (!context.binding.activeProjectId) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Primero elegí un proyecto con /project");
+      }
+      const resolved = await resolveEffectiveModel(deps.persistence, deps.adapter, chatId, context.binding.activeProjectId, context.binding.activeSessionId);
+      return okResult(resolved.effectiveModel);
+    },
+
+    async setActiveModel(input) {
+      const model = input.model.trim().replace(/^"|"$/gu, "");
+      if (!model) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Modelo no válido");
+      }
+      const nowIso = new Date().toISOString();
+      const context = await deps.persistence.runInTransaction((unit) => loadChatRuntimeContext(unit, input.chatId, nowIso));
+      if (!context.binding.activeProjectId) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Primero elegí un proyecto con /project");
+      }
+      if (!deps.adapter.listModels) {
+        return errResult(ERROR_CODES.UPSTREAM_5XX, "Catálogo de modelos no disponible en este entorno");
+      }
+      const catalog = await deps.adapter.listModels({ chatId: input.chatId, projectId: context.binding.activeProjectId, sessionId: context.binding.activeSessionId });
+      if (!catalog.ok) return catalog;
+      const allowed = new Set(catalog.value.models.map((m) => m.id));
+      if (!allowed.has(model)) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Modelo no válido");
+      }
+      await deps.persistence.runInTransaction(async (unit) => {
+        const repository = unit.modelSelections;
+        if (!repository) {
+          throw new DomainError(ERROR_CODES.PERSISTENCE_ERROR, "Repositorio de selección de modelo no disponible");
+        }
+        const selection: ModelSelection = { chatId: input.chatId, projectId: context.binding.activeProjectId!, activeModel: model, updatedAt: nowIso };
+        await repository.upsert(selection);
+      });
+      let sessionReconfigured = false;
+      if (context.binding.activeSessionId && deps.adapter.configureSessionModel) {
+        const configured = await deps.adapter.configureSessionModel({ projectId: context.binding.activeProjectId, sessionId: context.binding.activeSessionId, model });
+        if (!configured.ok) return configured;
+        sessionReconfigured = true;
+      }
+      const attachLocalReopened = await reopenAttachLocalIfNeeded({
+        localTerminalLauncher: deps.localTerminalLauncher,
+        persistence: deps.persistence,
+        chatId: input.chatId,
+        projectId: context.binding.activeProjectId,
+        sessionId: context.binding.activeSessionId,
+        sessionReconfigured,
+      });
+
+      return okResult({
+        activeModel: model,
+        sessionReconfigured,
+        ...(attachLocalReopened ? { attachLocalReopened } : {}),
+      });
+    },
+
     async selectProject(input) {
       const selector = input.selector.trim();
       if (!selector) {
@@ -389,6 +590,15 @@ export function createApplicationUseCases(
         return errResult(ERROR_CODES.VALIDATION_ERROR, "Primero elegí un proyecto con /project");
       }
 
+      const activeModelSelection = await deps.persistence.runInTransaction(async (unit) => {
+        if (!unit.modelSelections) {
+          return undefined;
+        }
+
+        return unit.modelSelections.findByChatAndProject(input.chatId, context.binding.activeProjectId!);
+      });
+      const desiredModel = activeModelSelection?.activeModel ?? context.session?.requestedModel ?? context.session?.effectiveModel;
+
       try {
         assertNoActiveTaskConflict(context.state, context.activeTask);
       } catch (error) {
@@ -398,6 +608,7 @@ export function createApplicationUseCases(
       const attached = await deps.adapter.attachSession({
         projectId: context.binding.activeProjectId,
         sessionId,
+        model: desiredModel,
       });
 
       if (!attached.ok) {
@@ -421,6 +632,8 @@ export function createApplicationUseCases(
           projectId: attached.value.projectId,
           createdAt: nowIso,
           updatedAt: nowIso,
+          requestedModel: attached.value.requestedModel,
+          effectiveModel: attached.value.effectiveModel,
         };
 
         const nextBinding: ChatBinding = {
@@ -447,6 +660,32 @@ export function createApplicationUseCases(
           sessionId: attached.value.sessionId,
         } satisfies SessionOutput;
       });
+
+      if (deps.localTerminalLauncher && deps.hasTmuxSessionBySessionId) {
+        const project = await deps.persistence.runInTransaction((unit) => unit.projects.findById(persisted.projectId));
+        if (project) {
+          const tmuxCheck = await deps.hasTmuxSessionBySessionId({
+            opencodeSessionId: persisted.sessionId,
+            timeoutMs: 3_000,
+          });
+
+          if (tmuxCheck.exists) {
+            try {
+              await deps.localTerminalLauncher.launchAttach({
+                projectPath: project.rootPath,
+                sessionId: persisted.sessionId,
+                tmuxSessionName: tmuxCheck.tmuxSessionName,
+              });
+            } catch (error) {
+              logger.error("Auto attach-local launch failed", {
+                projectId: persisted.projectId,
+                sessionId: persisted.sessionId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+        }
+      }
 
       return okResult(persisted);
     },
@@ -519,6 +758,32 @@ export function createApplicationUseCases(
           sessionId: created.value.sessionId,
         } satisfies SessionOutput;
       });
+
+      if (deps.localTerminalLauncher && deps.hasTmuxSessionBySessionId) {
+        const project = await deps.persistence.runInTransaction((unit) => unit.projects.findById(persisted.projectId));
+        if (project) {
+          const tmuxCheck = await deps.hasTmuxSessionBySessionId({
+            opencodeSessionId: persisted.sessionId,
+            timeoutMs: 3_000,
+          });
+
+          if (tmuxCheck.exists) {
+            try {
+              await deps.localTerminalLauncher.launchAttach({
+                projectPath: project.rootPath,
+                sessionId: persisted.sessionId,
+                tmuxSessionName: tmuxCheck.tmuxSessionName,
+              });
+            } catch (error) {
+              logger.error("Auto attach-local launch failed", {
+                projectId: persisted.projectId,
+                sessionId: persisted.sessionId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+        }
+      }
 
       return okResult(persisted);
     },
@@ -597,6 +862,32 @@ export function createApplicationUseCases(
         } satisfies BootstrapSessionCandidateOutput;
       });
 
+      if (deps.localTerminalLauncher && deps.hasTmuxSessionBySessionId) {
+        const project = await deps.persistence.runInTransaction((unit) => unit.projects.findById(persisted.projectId));
+        if (project) {
+          const tmuxCheck = await deps.hasTmuxSessionBySessionId({
+            opencodeSessionId: persisted.sessionId,
+            timeoutMs: 3_000,
+          });
+
+          if (tmuxCheck.exists) {
+            try {
+              await deps.localTerminalLauncher.launchAttach({
+                projectPath: project.rootPath,
+                sessionId: persisted.sessionId,
+                tmuxSessionName: tmuxCheck.tmuxSessionName,
+              });
+            } catch (error) {
+              logger.error("Auto attach-local launch failed", {
+                projectId: persisted.projectId,
+                sessionId: persisted.sessionId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+        }
+      }
+
       return okResult(persisted);
     },
 
@@ -622,11 +913,26 @@ export function createApplicationUseCases(
         return errResultFromUnknown(error);
       }
 
+      const effectiveModelResolution = await resolveEffectiveModel(
+        deps.persistence,
+        deps.adapter,
+        input.chatId,
+        context.binding.activeProjectId,
+        context.binding.activeSessionId
+      );
+
       const response = await deps.adapter.sendMessage({
         projectId: context.binding.activeProjectId,
         sessionId: context.binding.activeSessionId,
         message: text,
         chatId: input.chatId,
+        agent: await resolveEffectiveAgent(
+          deps.persistence,
+          input.chatId,
+          context.binding.activeProjectId,
+          deps.openCodeDefaultAgent
+        ),
+        model: effectiveModelResolution.effectiveModel,
         watch: buildWatcherRegistration(context.session, deps.createWatcherRegistration),
       });
 
@@ -678,6 +984,10 @@ export function createApplicationUseCases(
             terminalCause: undefined,
             terminalSource: undefined,
             notificationSentAt: undefined,
+            requestedAgent: response.value.requestedAgent,
+            requestedModel: response.value.requestedModel,
+            effectiveAgent: response.value.effectiveAgent,
+            effectiveModel: response.value.effectiveModel,
           });
         }
 
@@ -701,6 +1011,11 @@ export function createApplicationUseCases(
         needsAttention,
         status,
         state: response.value.state,
+        requestedAgent: response.value.requestedAgent,
+        requestedModel: response.value.requestedModel,
+        effectiveAgent: response.value.effectiveAgent,
+        effectiveModel: response.value.effectiveModel,
+        modelValidationDegraded: effectiveModelResolution.degraded,
       });
     },
 
@@ -726,11 +1041,26 @@ export function createApplicationUseCases(
         return errResultFromUnknown(error);
       }
 
+      const effectiveModelResolution = await resolveEffectiveModel(
+        deps.persistence,
+        deps.adapter,
+        input.chatId,
+        context.binding.activeProjectId,
+        context.binding.activeSessionId
+      );
+
       const response = await deps.adapter.runCommand({
         projectId: context.binding.activeProjectId,
         sessionId: context.binding.activeSessionId,
         command,
         chatId: input.chatId,
+        agent: await resolveEffectiveAgent(
+          deps.persistence,
+          input.chatId,
+          context.binding.activeProjectId,
+          deps.openCodeDefaultAgent
+        ),
+        model: effectiveModelResolution.effectiveModel,
         watch: buildWatcherRegistration(context.session, deps.createWatcherRegistration),
       });
 
@@ -781,6 +1111,10 @@ export function createApplicationUseCases(
             terminalCause: undefined,
             terminalSource: undefined,
             notificationSentAt: undefined,
+            requestedAgent: response.value.requestedAgent,
+            requestedModel: response.value.requestedModel,
+            effectiveAgent: response.value.effectiveAgent,
+            effectiveModel: response.value.effectiveModel,
           });
         }
 
@@ -805,6 +1139,11 @@ export function createApplicationUseCases(
         status,
         state: response.value.state,
         warning: modeResolution.warning,
+        requestedAgent: response.value.requestedAgent,
+        requestedModel: response.value.requestedModel,
+        effectiveAgent: response.value.effectiveAgent,
+        effectiveModel: response.value.effectiveModel,
+        modelValidationDegraded: effectiveModelResolution.degraded,
       });
     },
 
@@ -1119,6 +1458,83 @@ export function createApplicationUseCases(
 
       const fresh = await deps.persistence.runInTransaction((unit) => loadChatRuntimeContext(unit, chatId, nowIso));
       return okResult(toStatusOutput(fresh));
+    },
+
+    async refreshSessionMetadata(chatId) {
+      const nowIso = new Date().toISOString();
+      const context = await deps.persistence.runInTransaction((unit) => loadChatRuntimeContext(unit, chatId, nowIso));
+
+      if (!context.binding.activeProjectId || !context.binding.activeSessionId) {
+        return errResult(ERROR_CODES.VALIDATION_ERROR, "Primero elegí proyecto y sesión (/project, /session o /new)");
+      }
+
+      const currentState = context.state;
+
+      const remoteStatus = await deps.adapter.getSessionState({
+        projectId: context.binding.activeProjectId,
+        sessionId: context.binding.activeSessionId,
+      });
+
+      if (!remoteStatus.ok) {
+        const fallback = await deps.persistence.runInTransaction(async (unit) => {
+          const persisted = await unit.sessions.findById(context.binding.activeSessionId!);
+          if (!persisted) {
+            return undefined;
+          }
+
+          return {
+            requestedAgent: persisted.requestedAgent,
+            requestedModel: persisted.requestedModel,
+            effectiveAgent: persisted.effectiveAgent,
+            effectiveModel: persisted.effectiveModel,
+          };
+        });
+
+        return okResult({
+          projectId: context.binding.activeProjectId,
+          sessionId: context.binding.activeSessionId,
+          changed: false,
+          requestedAgent: fallback?.requestedAgent,
+          requestedModel: fallback?.requestedModel,
+          effectiveAgent: fallback?.effectiveAgent,
+          effectiveModel: fallback?.effectiveModel,
+        });
+      }
+
+      const synced = await syncRuntimeMetadata({
+        persistence: deps.persistence,
+        chatId,
+        projectId: context.binding.activeProjectId,
+        sessionId: context.binding.activeSessionId,
+        nowIso,
+        readRuntimeMessages: deps.readRuntimeMessages,
+        fallback: {
+          requestedAgent: context.session?.requestedAgent,
+          requestedModel: context.session?.requestedModel,
+          effectiveAgent: context.session?.effectiveAgent,
+          effectiveModel: context.session?.effectiveModel,
+        },
+      });
+
+      await deps.persistence.runInTransaction(async (unit) => {
+        if (remoteStatus.value.status === "running" && currentState.mode !== OPERATIONAL_MODES.TASK_RUNNING) {
+          await unit.states.upsert({
+            ...currentState,
+            mode: OPERATIONAL_MODES.TASK_RUNNING,
+            updatedAt: nowIso,
+          });
+        }
+      });
+
+      return okResult({
+        projectId: context.binding.activeProjectId,
+        sessionId: context.binding.activeSessionId,
+        changed: synced.changed,
+        requestedAgent: synced.requestedAgent,
+        requestedModel: synced.requestedModel,
+        effectiveAgent: synced.effectiveAgent,
+        effectiveModel: synced.effectiveModel,
+      });
     },
 
     async confirmDangerousAction(input) {
@@ -1478,6 +1894,22 @@ export function createApplicationUseCases(
       return okResult(preflight.output);
     },
   };
+
+}
+
+function normalizeAgentSelectionInput(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed.length < 2) {
+    return trimmed;
+  }
+
+  const startsWithDoubleQuote = trimmed.startsWith('"') && trimmed.endsWith('"');
+  const startsWithSingleQuote = trimmed.startsWith("'") && trimmed.endsWith("'");
+  if (!startsWithDoubleQuote && !startsWithSingleQuote) {
+    return trimmed;
+  }
+
+  return trimmed.slice(1, -1).trim();
 }
 
 export async function bootRecover(
@@ -1806,6 +2238,150 @@ async function invalidateDangerousConfirmationsForSession(
     sessionId,
     reason: "session-changed",
   });
+}
+
+async function resolveEffectiveAgent(
+  persistence: PersistenceDriver,
+  chatId: string,
+  projectId: string,
+  configuredDefaultAgent?: SupportedAgent
+): Promise<SupportedAgent> {
+  const selection = await persistence.runInTransaction(async (unit) => {
+    if (!unit.agentSelections) return undefined;
+    return unit.agentSelections.findByChatAndProject(chatId, projectId);
+  });
+
+  if (selection?.activeAgent && isSupportedAgent(selection.activeAgent)) {
+    return selection.activeAgent;
+  }
+
+  return configuredDefaultAgent ?? SUPPORTED_AGENTS.BUILD;
+}
+
+async function resolveEffectiveModel(
+  persistence: PersistenceDriver,
+  adapter: OpenCodeSessionAdapter,
+  chatId: string,
+  projectId: string,
+  sessionId?: string
+): Promise<{ effectiveModel: string; requestedModel?: string; fallbackApplied: boolean; degraded?: string }> {
+  const selection = await persistence.runInTransaction(async (unit) => {
+    if (!unit.modelSelections) return undefined;
+    return unit.modelSelections.findByChatAndProject(chatId, projectId);
+  });
+
+  const requestedModel = selection?.activeModel;
+  const defaultModel = "openai/gpt-5.3-codex";
+
+  if (!adapter.listModels) {
+    return { effectiveModel: requestedModel ?? defaultModel, requestedModel, fallbackApplied: false, degraded: "unsupported" };
+  }
+
+  const catalog = await adapter.listModels({ chatId, projectId, sessionId });
+  if (!catalog.ok || !catalog.value.ok) {
+    return {
+      effectiveModel: requestedModel ?? defaultModel,
+      requestedModel,
+      fallbackApplied: false,
+      degraded: catalog.ok ? catalog.value.degraded?.reason : "unavailable",
+    };
+  }
+
+  const modelIds = new Set(catalog.value.models.map((m) => m.id));
+  if (requestedModel && modelIds.has(requestedModel)) {
+    return { effectiveModel: requestedModel, requestedModel, fallbackApplied: false };
+  }
+
+  const effectiveModel = modelIds.has(defaultModel) ? defaultModel : catalog.value.models[0]?.id ?? defaultModel;
+  return { effectiveModel, requestedModel, fallbackApplied: Boolean(requestedModel && requestedModel !== effectiveModel) };
+}
+
+async function reopenAttachLocalIfNeeded(input: {
+  readonly localTerminalLauncher?: LocalTerminalLauncher;
+  readonly persistence: PersistenceDriver;
+  readonly chatId: string;
+  readonly projectId?: string;
+  readonly sessionId?: string;
+  readonly sessionReconfigured: boolean;
+}): Promise<boolean> {
+  if (!input.sessionReconfigured || !input.localTerminalLauncher || !input.projectId || !input.sessionId) {
+    return false;
+  }
+
+  const project = await input.persistence.runInTransaction((unit) => unit.projects.findById(input.projectId!));
+  if (!project) {
+    return false;
+  }
+
+  try {
+    await input.localTerminalLauncher.launchAttach({
+      projectPath: project.rootPath,
+      sessionId: input.sessionId,
+      tmuxSessionName: toTmuxSessionName(input.sessionId),
+    });
+    return true;
+  } catch (error) {
+    logger.error("Auto attach-local reopen failed", {
+      chatId: input.chatId,
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+function mergeSessionMetadata(
+  session: {
+    readonly sessionId: string;
+    readonly projectId: string;
+    readonly createdAt: string;
+    readonly updatedAt?: string;
+    readonly requestedAgent?: string;
+    readonly requestedModel?: string;
+    readonly effectiveAgent?: string;
+    readonly effectiveModel?: string;
+  },
+  state: SessionState
+): {
+  readonly sessionId: string;
+  readonly projectId: string;
+  readonly createdAt: string;
+  readonly updatedAt?: string;
+  readonly requestedAgent?: string;
+  readonly requestedModel?: string;
+  readonly effectiveAgent?: string;
+  readonly effectiveModel?: string;
+} {
+  return {
+    ...session,
+    requestedAgent: state.requestedAgent ?? session.requestedAgent,
+    requestedModel: state.requestedModel ?? session.requestedModel,
+    effectiveAgent: state.effectiveAgent ?? session.effectiveAgent ?? state.requestedAgent ?? session.requestedAgent,
+    effectiveModel: state.effectiveModel ?? session.effectiveModel ?? session.requestedModel,
+  };
+}
+
+function hasSessionMetadataChanged(
+  before: {
+    readonly requestedAgent?: string;
+    readonly requestedModel?: string;
+    readonly effectiveAgent?: string;
+    readonly effectiveModel?: string;
+  },
+  after: {
+    readonly requestedAgent?: string;
+    readonly requestedModel?: string;
+    readonly effectiveAgent?: string;
+    readonly effectiveModel?: string;
+  }
+): boolean {
+  return (
+    before.requestedAgent !== after.requestedAgent ||
+    before.requestedModel !== after.requestedModel ||
+    before.effectiveAgent !== after.effectiveAgent ||
+    before.effectiveModel !== after.effectiveModel
+  );
 }
 
 function okResult<T>(value: T): Result<T> {

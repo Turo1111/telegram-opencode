@@ -24,6 +24,11 @@
     "verify:rfc12": "ts-node src/verification/rfc12-local-host-hardening.ts",
     "verify:rfc13": "ts-node src/verification/rfc13-new-pty-bootstrap-session.ts",
     "verify:rfc14": "ts-node src/verification/rfc14-attach-local.ts",
+    "verify:rfc16": "ts-node src/verification/rfc16-agent-selection.ts",
+    "verify:rfc17": "ts-node src/verification/rfc17-model-selection.ts",
+    "verify:rfc19:closure": "ts-node src/verification/rfc19-closure-gate.ts",
+    "verify:rfc19:closure:negative": "ts-node src/verification/rfc19-closure-gate-negative.ts",
+    "verify:rfc19": "npm run verify:rfc11 && npm run verify:rfc19:closure && npm run verify:rfc19:closure:negative",
     "start:local": "node start-local.js",
     "stop:local": "node stop-local.js"
   },

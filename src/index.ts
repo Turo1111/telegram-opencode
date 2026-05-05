@@ -12,6 +12,8 @@ import { OPEN_CODE_ADAPTER_MODE } from "./infrastructure/opencode-adapter-mode";
 import { createOpenCodeCliMirrorService } from "./application/opencode-cli-mirror-service";
 import { createLocalTerminalLauncher } from "./infrastructure/local-terminal-launcher";
 import { hasSessionByOpenCodeSessionId } from "./infrastructure/opencode-tmux-host";
+import { exportSession } from "./infrastructure/opencode-cli";
+import { readOpenCodeLocalSessionMessages } from "./infrastructure/opencode-local-store";
 
 interface StartupDependencies {
   readonly loadConfig: typeof loadConfig;
@@ -84,6 +86,7 @@ export async function bootstrapApplication(deps: StartupDependencies = DEFAULT_S
         config,
         persistence,
         adapter,
+        readRuntimeMessages: buildRuntimeMessagesReader(config),
         callbackUrl: receiver.callbackUrl,
         notify: async (notice) => {
           if (!botRef) {
@@ -118,6 +121,8 @@ export async function bootstrapApplication(deps: StartupDependencies = DEFAULT_S
     },
     localTerminalLauncher,
     hasTmuxSessionBySessionId: hasSessionByOpenCodeSessionId,
+    openCodeDefaultAgent: config.openCodeDefaultAgent,
+    readRuntimeMessages: buildRuntimeMessagesReader(config),
     onAssistantMessageProduced: ({ sessionId, message }) => {
       cliMirror?.registerTelegramEcho(sessionId, message);
     },
@@ -157,6 +162,27 @@ export async function bootstrapApplication(deps: StartupDependencies = DEFAULT_S
     await watcher.restoreAfterRestart();
     watcher.startScheduler();
   }
+}
+
+function buildRuntimeMessagesReader(config: ReturnType<typeof loadConfig>) {
+  const adapterMode = config.openCodeAdapter ?? OPEN_CODE_ADAPTER_MODE.HTTP;
+  const isLocalCliLikeMode =
+    adapterMode === OPEN_CODE_ADAPTER_MODE.CLI || adapterMode === OPEN_CODE_ADAPTER_MODE.PTY;
+
+  if (isLocalCliLikeMode) {
+    return async (sessionId: string) => {
+      const exported = await readOpenCodeLocalSessionMessages({ sessionId });
+      return exported.messages;
+    };
+  }
+
+  return async (sessionId: string) => {
+    const exported = await exportSession({
+      sessionId,
+      timeoutMs: config.openCodeControlTimeoutMs,
+    });
+    return exported.messages;
+  };
 }
 
 async function main() {

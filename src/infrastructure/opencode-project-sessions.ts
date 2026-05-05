@@ -55,6 +55,7 @@ export type ProjectSessionInspectionResult =
 interface InspectProjectSessionsInput {
   readonly projectPath: string;
   readonly timeoutMs: number;
+  readonly cwd?: string;
   readonly cliOps?: {
     readonly listSessions: typeof listSessions;
     readonly resolveCanonicalProjectPath: typeof resolveCanonicalProjectPath;
@@ -78,7 +79,20 @@ export async function inspectProjectSessions(
 
   try {
     const canonicalProjectPath = await cliOps.resolveCanonicalProjectPath(input.projectPath);
-    const sessions = await cliOps.listSessions(input.timeoutMs);
+    traceSessionsDebug("inspect:canonical-project", {
+      inputProjectPath: input.projectPath,
+      canonicalProjectPath,
+    });
+    const sessions = await cliOps.listSessions(input.timeoutMs, input.cwd ?? input.projectPath);
+    traceSessionsDebug("inspect:raw-sessions", {
+      total: sessions.length,
+      sessions: sessions.slice(0, 5).map((session) => ({
+        id: session.id,
+        path: session.path,
+        title: session.title,
+        updatedAt: session.updatedAt,
+      })),
+    });
 
     const inspected = await Promise.all(
       sessions.map(async (session) => {
@@ -86,6 +100,12 @@ export async function inspectProjectSessions(
           projectPath: canonicalProjectPath,
           session,
           resolveCanonicalProjectPath: cliOps.resolveCanonicalProjectPath,
+        });
+
+        traceSessionsDebug("inspect:classified-session", {
+          sessionId: session.id,
+          path: session.path,
+          association: candidate.association,
         });
 
         return {
@@ -178,4 +198,12 @@ function compareProjectSessions(left: ProjectSessionInspection, right: ProjectSe
   }
 
   return left.sessionId.localeCompare(right.sessionId);
+}
+
+function traceSessionsDebug(label: string, payload: unknown): void {
+  if (process.env.TGOC_TRACE_SESSIONS !== "1") {
+    return;
+  }
+
+  console.log(`[tgoc/sesiones] ${label}`, payload);
 }

@@ -287,6 +287,10 @@ function handleSessionMessage(body: Record<string, unknown>, res: http.ServerRes
   }
 
   const { session, message } = validation;
+  const agent = asOptionalString(body.agent);
+  if (agent) {
+    console.log(`[mock] agent=${agent} project=${session.projectId} session=${session.sessionId}`);
+  }
   const needsAttention = body.forceNeedsAttention === true;
   const running = body.forceRunning === true;
   const nextStatus: SessionStatus = needsAttention ? "needs-attention" : running ? "running" : "linked";
@@ -312,6 +316,10 @@ function handleSessionMessage(body: Record<string, unknown>, res: http.ServerRes
     taskId: updated.taskId,
     needsAttention,
     message: `Respuesta mock sesión: ${message}`,
+    requestedAgent: asOptionalString(body.agent),
+    effectiveAgent: asOptionalString(body.forceEffectiveAgent) ?? asOptionalString(body.agent),
+    requestedModel: asOptionalString(body.requestedModel),
+    effectiveModel: asOptionalString(body.forceEffectiveModel),
     updatedAt: updated.updatedAt,
   });
 }
@@ -481,6 +489,10 @@ function scheduleWebhookForSession(
   const webhookDelayMs = asNumber(body.webhookDelayMs) ?? 25;
   const shouldFail = body.forceWebhookFailure === true;
   const needsInput = body.forceNeedsAttention === true;
+  const requestedAgent = asOptionalString(body.agent);
+  const effectiveAgent = asOptionalString(body.forceEffectiveAgent) ?? requestedAgent;
+  const requestedModel = asOptionalString(body.requestedModel);
+  const effectiveModel = asOptionalString(body.forceEffectiveModel);
 
   if (session.status === "running") {
     queueWebhook(session, {
@@ -500,6 +512,10 @@ function scheduleWebhookForSession(
       timestamp: new Date().toISOString(),
       data: {
         summary: shouldFail ? `Mock falló ejecutando: ${message}` : `Mock completó: ${message}`,
+        requestedAgent,
+        effectiveAgent,
+        requestedModel,
+        effectiveModel,
       },
     }, webhookDelayMs + 25);
     return;

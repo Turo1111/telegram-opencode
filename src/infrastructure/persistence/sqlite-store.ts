@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   ActiveTaskRepository,
+  AgentSelectionRepository,
+  ModelSelectionRepository,
   BindingRepository,
   DangerousActionConfirmationRepository,
   PendingPromptRepository,
@@ -16,6 +18,8 @@ import {
 import { Config } from "../../config";
 import {
   ActiveTask,
+  AgentSelection,
+  ModelSelection,
   ChatBinding,
   DangerousActionConfirmation,
   DangerousActionConfirmationStatus,
@@ -71,6 +75,10 @@ interface SessionRow {
   notification_sent_at: string | null;
   continuity_lost_at: string | null;
   watchdog_retry_count: number | null;
+  requested_agent: string | null;
+  requested_model: string | null;
+  effective_agent: string | null;
+  effective_model: string | null;
 }
 
 interface BindingRow {
@@ -117,6 +125,20 @@ interface PendingPromptRow {
   telegram_callback_query_id: string | null;
   submitted_input: string | null;
   created_at: string;
+  updated_at: string;
+}
+
+interface AgentSelectionRow {
+  chat_id: string;
+  project_id: string;
+  active_agent: string;
+  updated_at: string;
+}
+
+interface ModelSelectionRow {
+  chat_id: string;
+  project_id: string;
+  active_model: string;
   updated_at: string;
 }
 
@@ -167,6 +189,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   notification_sent_at TEXT,
   continuity_lost_at TEXT,
   watchdog_retry_count INTEGER,
+  requested_agent TEXT,
+  requested_model TEXT,
+  effective_agent TEXT,
+  effective_model TEXT,
   FOREIGN KEY(project_id) REFERENCES projects(project_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_project_id ON sessions(project_id);
@@ -201,6 +227,24 @@ CREATE TABLE IF NOT EXISTS active_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_active_tasks_session_id ON active_tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_active_tasks_session_status ON active_tasks(session_id, status);
+
+CREATE TABLE IF NOT EXISTS agent_selections (
+  chat_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  active_agent TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(chat_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_selections_project_id ON agent_selections(project_id);
+
+CREATE TABLE IF NOT EXISTS model_selections (
+  chat_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  active_model TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(chat_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_model_selections_project_id ON model_selections(project_id);
 
 CREATE TABLE IF NOT EXISTS pending_prompts (
   prompt_id TEXT PRIMARY KEY,
@@ -293,6 +337,7 @@ function initializeSqlite(db: SqliteDatabase): void {
   db.exec("PRAGMA synchronous = FULL;");
   db.exec(SCHEMA_SQL);
   ensureSessionColumns(db);
+  ensureSessionMetadataColumns(db);
   ensureStateColumns(db);
   ensureDangerousActionColumns(db);
 }
@@ -422,10 +467,90 @@ function createSqliteUnit(db: SqliteDatabase): PersistenceUnit {
   const bindings = createBindingRepository(db);
   const states = createStateRepository(db);
   const tasks = createActiveTaskRepository(db);
+  const agentSelections = createAgentSelectionRepository(db);
+  const modelSelections = createModelSelectionRepository(db);
   const pendingPrompts = createPendingPromptRepository(db);
   const dangerousActionConfirmations = createDangerousActionConfirmationRepository(db);
 
-  return { projects, sessions, bindings, states, tasks, pendingPrompts, dangerousActionConfirmations };
+  return {
+    projects,
+    sessions,
+    bindings,
+    states,
+    tasks,
+    agentSelections,
+    modelSelections,
+    pendingPrompts,
+    dangerousActionConfirmations,
+  };
+}
+
+function createAgentSelectionRepository(db: SqliteDatabase): AgentSelectionRepository {
+  return {
+    async findByChatAndProject(chatId, projectId) {
+      const row = db
+        .prepare<AgentSelectionRow>(
+          "SELECT chat_id, project_id, active_agent, updated_at FROM agent_selections WHERE chat_id = :chatId AND project_id = :projectId"
+        )
+        .get({ chatId, projectId });
+
+      if (!row) return undefined;
+      return {
+        chatId: row.chat_id,
+        projectId: row.project_id,
+        activeAgent: row.active_agent as AgentSelection["activeAgent"],
+        updatedAt: row.updated_at,
+      };
+    },
+    async upsert(selection) {
+      db.prepare(
+        `INSERT INTO agent_selections (chat_id, project_id, active_agent, updated_at)
+         VALUES (:chatId, :projectId, :activeAgent, :updatedAt)
+         ON CONFLICT(chat_id, project_id) DO UPDATE SET
+           active_agent = excluded.active_agent,
+           updated_at = excluded.updated_at`
+      ).run({
+        chatId: selection.chatId,
+        projectId: selection.projectId,
+        activeAgent: selection.activeAgent,
+        updatedAt: selection.updatedAt,
+      });
+    },
+  };
+}
+
+function createModelSelectionRepository(db: SqliteDatabase): ModelSelectionRepository {
+  return {
+    async findByChatAndProject(chatId, projectId) {
+      const row = db
+        .prepare<ModelSelectionRow>(
+          "SELECT chat_id, project_id, active_model, updated_at FROM model_selections WHERE chat_id = :chatId AND project_id = :projectId"
+        )
+        .get({ chatId, projectId });
+
+      if (!row) return undefined;
+      return {
+        chatId: row.chat_id,
+        projectId: row.project_id,
+        activeModel: row.active_model,
+        updatedAt: row.updated_at,
+      };
+    },
+    async upsert(selection) {
+      db.prepare(
+        `INSERT INTO model_selections (chat_id, project_id, active_model, updated_at)
+         VALUES (:chatId, :projectId, :activeModel, :updatedAt)
+         ON CONFLICT(chat_id, project_id) DO UPDATE SET
+           active_model = excluded.active_model,
+           updated_at = excluded.updated_at`
+      ).run({
+        chatId: selection.chatId,
+        projectId: selection.projectId,
+        activeModel: selection.activeModel,
+        updatedAt: selection.updatedAt,
+      });
+    },
+  };
 }
 
 function ensureDangerousActionColumns(db: SqliteDatabase): void {
@@ -435,6 +560,13 @@ function ensureDangerousActionColumns(db: SqliteDatabase): void {
   ensureColumn(db, "ALTER TABLE dangerous_action_confirmations ADD COLUMN tmux_session_name TEXT;");
   ensureColumn(db, "ALTER TABLE dangerous_action_confirmations ADD COLUMN manual_command TEXT;");
   ensureColumn(db, "ALTER TABLE dangerous_action_confirmations ADD COLUMN executed_at TEXT;");
+}
+
+function ensureSessionMetadataColumns(db: SqliteDatabase): void {
+  ensureColumn(db, "ALTER TABLE sessions ADD COLUMN requested_agent TEXT;");
+  ensureColumn(db, "ALTER TABLE sessions ADD COLUMN requested_model TEXT;");
+  ensureColumn(db, "ALTER TABLE sessions ADD COLUMN effective_agent TEXT;");
+  ensureColumn(db, "ALTER TABLE sessions ADD COLUMN effective_model TEXT;");
 }
 
 function createProjectRepository(db: SqliteDatabase): ProjectRepository {
@@ -494,7 +626,8 @@ function createSessionRepository(db: SqliteDatabase): SessionRepository {
       const row = db.prepare<SessionRow>(
         `SELECT session_id, project_id, created_at, updated_at, watcher_token, watcher_callback_url,
                 watcher_enabled, last_observed_at, awaiting_input_at, terminal_cause, terminal_source,
-                notification_sent_at, continuity_lost_at, watchdog_retry_count
+                notification_sent_at, continuity_lost_at, watchdog_retry_count,
+                requested_agent, requested_model, effective_agent, effective_model
            FROM sessions WHERE session_id = :sessionId`
       ).get({ sessionId });
 
@@ -505,7 +638,8 @@ function createSessionRepository(db: SqliteDatabase): SessionRepository {
         .prepare<SessionRow>(
           `SELECT session_id, project_id, created_at, updated_at, watcher_token, watcher_callback_url,
                   watcher_enabled, last_observed_at, awaiting_input_at, terminal_cause, terminal_source,
-                  notification_sent_at, continuity_lost_at, watchdog_retry_count
+                  notification_sent_at, continuity_lost_at, watchdog_retry_count,
+                  requested_agent, requested_model, effective_agent, effective_model
              FROM sessions WHERE project_id = :projectId ORDER BY created_at ASC`
         )
         .all({ projectId });
@@ -517,7 +651,8 @@ function createSessionRepository(db: SqliteDatabase): SessionRepository {
         .prepare<SessionRow>(
           `SELECT session_id, project_id, created_at, updated_at, watcher_token, watcher_callback_url,
                   watcher_enabled, last_observed_at, awaiting_input_at, terminal_cause, terminal_source,
-                  notification_sent_at, continuity_lost_at, watchdog_retry_count
+                  notification_sent_at, continuity_lost_at, watchdog_retry_count,
+                  requested_agent, requested_model, effective_agent, effective_model
              FROM sessions ORDER BY created_at ASC`
         )
         .all();
@@ -527,14 +662,16 @@ function createSessionRepository(db: SqliteDatabase): SessionRepository {
     async upsert(session) {
       db.prepare(
         `INSERT INTO sessions (
-           session_id, project_id, created_at, updated_at, watcher_token, watcher_callback_url,
+         session_id, project_id, created_at, updated_at, watcher_token, watcher_callback_url,
            watcher_enabled, last_observed_at, awaiting_input_at, terminal_cause, terminal_source,
-           notification_sent_at, continuity_lost_at, watchdog_retry_count
+           notification_sent_at, continuity_lost_at, watchdog_retry_count,
+           requested_agent, requested_model, effective_agent, effective_model
          )
          VALUES (
            :sessionId, :projectId, :createdAt, :updatedAt, :watcherToken, :watcherCallbackUrl,
            :watcherEnabled, :lastObservedAt, :awaitingInputAt, :terminalCause, :terminalSource,
-           :notificationSentAt, :continuityLostAt, :watchdogRetryCount
+           :notificationSentAt, :continuityLostAt, :watchdogRetryCount,
+           :requestedAgent, :requestedModel, :effectiveAgent, :effectiveModel
          )
          ON CONFLICT(session_id) DO UPDATE SET
             project_id = excluded.project_id,
@@ -549,7 +686,11 @@ function createSessionRepository(db: SqliteDatabase): SessionRepository {
             terminal_source = excluded.terminal_source,
             notification_sent_at = excluded.notification_sent_at,
             continuity_lost_at = excluded.continuity_lost_at,
-            watchdog_retry_count = excluded.watchdog_retry_count`
+            watchdog_retry_count = excluded.watchdog_retry_count,
+            requested_agent = excluded.requested_agent,
+            requested_model = excluded.requested_model,
+            effective_agent = excluded.effective_agent,
+            effective_model = excluded.effective_model`
       ).run({
         sessionId: session.sessionId,
         projectId: session.projectId,
@@ -565,6 +706,10 @@ function createSessionRepository(db: SqliteDatabase): SessionRepository {
         notificationSentAt: session.notificationSentAt ?? null,
         continuityLostAt: session.continuityLostAt ?? null,
         watchdogRetryCount: session.watchdogRetryCount ?? 0,
+        requestedAgent: session.requestedAgent ?? null,
+        requestedModel: session.requestedModel ?? null,
+        effectiveAgent: session.effectiveAgent ?? null,
+        effectiveModel: session.effectiveModel ?? null,
       });
     },
   };
@@ -857,6 +1002,10 @@ function mapSessionRow(row: SessionRow): Session {
     notificationSentAt: row.notification_sent_at ?? undefined,
     continuityLostAt: row.continuity_lost_at ?? undefined,
     watchdogRetryCount: row.watchdog_retry_count ?? undefined,
+    requestedAgent: row.requested_agent ?? undefined,
+    requestedModel: row.requested_model ?? undefined,
+    effectiveAgent: row.effective_agent ?? undefined,
+    effectiveModel: row.effective_model ?? undefined,
   };
 }
 

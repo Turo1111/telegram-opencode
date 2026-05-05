@@ -36,6 +36,15 @@ interface LocalMessageData {
     readonly created?: number;
     readonly completed?: number;
   };
+  readonly info?: {
+    readonly agent?: string;
+    readonly model?: {
+      readonly providerID?: string;
+      readonly provider_id?: string;
+      readonly modelID?: string;
+      readonly model_id?: string;
+    };
+  };
 }
 
 interface LocalPartData {
@@ -47,6 +56,13 @@ interface LocalPartData {
 interface PendingLocalMessage {
   readonly id: string;
   readonly createdAt?: string;
+  readonly info?: {
+    readonly agent?: string;
+    readonly model?: {
+      readonly providerID?: string;
+      readonly modelID?: string;
+    };
+  };
   readonly parts: string[];
 }
 
@@ -127,6 +143,13 @@ function collectAssistantMessages(rows: readonly LocalSessionRow[]): readonly Op
           readTimestamp(messageData?.time?.created) ??
           readTimestamp(messageData?.time?.completed) ??
           readTimestamp(row.message_time_created),
+        info: {
+          agent: normalizeMetaString(messageData?.info?.agent),
+          model: {
+            providerID: normalizeMetaString(messageData?.info?.model?.providerID ?? messageData?.info?.model?.provider_id),
+            modelID: normalizeMetaString(messageData?.info?.model?.modelID ?? messageData?.info?.model?.model_id),
+          },
+        },
         parts: [],
       };
     }
@@ -155,6 +178,7 @@ function pushCompletedMessage(target: OpenCodeCliMessage[], message: PendingLoca
     role: OPEN_CODE_CLI_ROLE.ASSISTANT,
     text,
     createdAt: message.createdAt,
+    info: message.info,
   });
 }
 
@@ -210,4 +234,13 @@ function readTimestamp(value: number | undefined): string | undefined {
   }
 
   return new Date(value).toISOString();
+}
+
+function normalizeMetaString(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
 }

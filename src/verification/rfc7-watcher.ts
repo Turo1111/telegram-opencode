@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   OpenCodeSessionAdapter,
   Result,
+  AsyncSessionNotice,
   SESSION_EVENT_KIND,
   SessionEvent,
   SessionState,
@@ -11,6 +12,7 @@ import {
   ObserveSessionResult,
   CancelOrInterruptResult,
   WebhookAuthContext,
+  SessionMetadataSyncResult,
 } from "../application/contracts";
 import { createSessionWatcherService } from "../application/session-watcher-service";
 import { ACTIVE_TASK_STATUS, OPERATIONAL_MODES } from "../domain/entities";
@@ -21,6 +23,7 @@ import {
   createSessionWebhookReceiver,
   type ReceiverHandlerResult,
 } from "../infrastructure/http/session-webhook-receiver";
+import { formatAsyncSessionNotice } from "../adapters/telegram/templates";
 
 interface ScenarioResult {
   readonly id: string;
@@ -84,6 +87,26 @@ class VerificationAdapter implements OpenCodeSessionAdapter {
   async submitPromptInput(): Promise<Result<{ status: "accepted"; message?: string }>> {
     return { ok: true, value: { status: "accepted" } };
   }
+
+  async refreshSessionMetadata(input: { chatId: string }): Promise<Result<SessionMetadataSyncResult>> {
+    const session = await this.getSessionState({ projectId: "proj-sync", sessionId: "sess-sync" });
+    if (!session.ok) {
+      return { ok: false, error: session.error } as Result<SessionMetadataSyncResult>;
+    }
+    return {
+      ok: true,
+      value: {
+        chatId: input.chatId,
+        projectId: "proj-sync",
+        sessionId: "sess-sync",
+        changed: true,
+        requestedAgent: "plan",
+        requestedModel: "gpt-5.3",
+        effectiveAgent: "build",
+        effectiveModel: "gpt-5.2",
+      },
+    };
+  }
 }
 
 function assert(condition: boolean, message: string): void {
@@ -124,7 +147,7 @@ async function verificationHarness(
     readonly config: Config;
     readonly tempDir: string;
     readonly adapter: VerificationAdapter;
-    readonly notices: string[];
+    readonly notices: AsyncSessionNotice[];
     readonly receiver: Awaited<ReturnType<typeof createSessionWebhookReceiver>>;
     readonly watcher: ReturnType<typeof createSessionWatcherService>;
     readonly registration: ReturnType<ReturnType<typeof createSessionWatcherService>["createRegistration"]>;
@@ -132,7 +155,7 @@ async function verificationHarness(
   }) => Promise<void>
 ): Promise<void> {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `${options.fixtureName}-`));
-  const notices: string[] = [];
+  const notices: AsyncSessionNotice[] = [];
   const adapter = new VerificationAdapter();
 
   const config: Config = {
@@ -183,7 +206,7 @@ async function verificationHarness(
     adapter,
     callbackUrl: receiver.callbackUrl,
     notify: async (notice) => {
-      notices.push(`${notice.kind}:${notice.sessionId}`);
+      notices.push(notice);
     },
   });
 
@@ -461,7 +484,7 @@ async function main(): Promise<void> {
           assert(first.status === 202, `first terminal event should be accepted, got ${first.status}`);
           assert(replay.status === 403, `replay should be rejected with 403, got ${replay.status}`);
 
-          const terminalNotices = notices.filter((entry) => entry === "terminal:sess-terminal");
+          const terminalNotices = notices.filter((entry) => entry.kind === "terminal" && entry.sessionId === "sess-terminal");
           assert(terminalNotices.length === 1, `expected one terminal notification, got ${terminalNotices.length}`);
         }
       );
@@ -507,7 +530,7 @@ async function main(): Promise<void> {
           });
 
           assert(response.status === 202, `needs-input should be accepted, got ${response.status}`);
-          assert(notices.includes("needs-input:sess-needs-input"), "needs-input notice not emitted");
+          assert(notices.some((n) => n.kind === "needs-input" && n.sessionId === "sess-needs-input"), "needs-input notice not emitted");
 
           const session = await persistence.runInTransaction((unit) => unit.sessions.findById("sess-needs-input"));
           assert(session?.terminalCause === undefined, "needs-input should not terminalize the session");
@@ -547,7 +570,7 @@ async function main(): Promise<void> {
 
           const session = await persistence.runInTransaction((unit) => unit.sessions.findById("sess-watchdog"));
           assert(Boolean(session?.terminalCause), "watchdog did not terminalize stale session");
-          assert(notices.includes("terminal:sess-watchdog"), "watchdog terminal notice missing");
+          assert(notices.some((n) => n.kind === "terminal" && n.sessionId === "sess-watchdog"), "watchdog terminal notice missing");
         }
       );
 
@@ -627,7 +650,7 @@ async function main(): Promise<void> {
 
           const session = await persistence.runInTransaction((unit) => unit.sessions.findById("sess-restart"));
           assert(session?.watcherToken === undefined, "restart should invalidate prior watcher token");
-          assert(notices.includes("continuity-lost:sess-restart"), "restart continuity-lost notice missing");
+          assert(notices.some((n) => n.kind === "continuity-lost" && n.sessionId === "sess-restart"), "restart continuity-lost notice missing");
 
           const replay = await fetch(receiver.callbackUrl, {
             method: "POST",
@@ -649,6 +672,302 @@ async function main(): Promise<void> {
         return "restart-token-replay-rejected";
       }
     )
+  );
+
+  results.push(
+    await runCase("S10", "Terminal metadata propagation", "terminal notice carries effective fields and fallback drift", async () => {
+      await verificationHarness(
+        {
+          fixtureName: "rfc18-terminal-metadata",
+          webhookPortStart: 4220,
+          webhookPortEnd: 4221,
+          watchdogStaleAfterMs: 1,
+          watchdogMaxRetryCount: 2,
+        },
+        async ({ persistence, tempDir, receiver, registration, notices }) => {
+          await seedSessionFixture({
+            persistence,
+            tempDir,
+            projectId: "proj-rfc18",
+            sessionId: "sess-rfc18",
+            chatId: "7007",
+            taskId: "task-rfc18",
+            watcherToken: registration.bearerToken,
+            watcherCallbackUrl: receiver.callbackUrl,
+          });
+
+          await persistence.runInTransaction(async (unit) => {
+            const existing = await unit.sessions.findById("sess-rfc18");
+            if (!existing) return;
+            await unit.sessions.upsert({
+              ...existing,
+              requestedAgent: "plan",
+              requestedModel: "openai/gpt-5.3-codex",
+              effectiveAgent: "plan",
+            });
+          });
+
+          const response = await fetch(receiver.callbackUrl, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${registration.bearerToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              event: SESSION_EVENT_KIND.COMPLETED,
+              session_id: "sess-rfc18",
+              timestamp: new Date().toISOString(),
+              data: {
+                requested_model: "openai/gpt-5.3-codex",
+                effective_model: "openai/gpt-4.1",
+                requested_agent: "plan",
+                effective_agent: "build",
+              },
+            }),
+          });
+
+          assert(response.status === 202, `terminal should be accepted, got ${response.status}`);
+
+          const terminal = notices.find((n) => n.kind === "terminal" && n.sessionId === "sess-rfc18");
+          assert(Boolean(terminal), "terminal metadata notice missing");
+          assert(terminal?.effectiveModel === "openai/gpt-4.1", "effectiveModel not propagated");
+          assert(terminal?.effectiveAgent === "build", "effectiveAgent not propagated");
+          assert(terminal?.fallbackInfo?.kind === "multiple", "fallback kind should be multiple");
+        }
+      );
+
+      return "terminal-metadata-ok";
+    })
+  );
+
+  results.push(
+    await runCase("S11", "Terminal error with partial metadata", "error notice keeps available effective metadata and renders missing model as no disponible", async () => {
+      await verificationHarness(
+        {
+          fixtureName: "rfc18-terminal-error-partial",
+          webhookPortStart: 4222,
+          webhookPortEnd: 4223,
+          watchdogStaleAfterMs: 1,
+          watchdogMaxRetryCount: 2,
+        },
+        async ({ persistence, tempDir, receiver, registration, notices }) => {
+          await seedSessionFixture({
+            persistence,
+            tempDir,
+            projectId: "proj-rfc18-err",
+            sessionId: "sess-rfc18-err",
+            chatId: "7008",
+            taskId: "task-rfc18-err",
+            watcherToken: registration.bearerToken,
+            watcherCallbackUrl: receiver.callbackUrl,
+          });
+
+          const response = await fetch(receiver.callbackUrl, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${registration.bearerToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              event: SESSION_EVENT_KIND.FAILED,
+              session_id: "sess-rfc18-err",
+              timestamp: new Date().toISOString(),
+              data: {
+                effective_agent: "build",
+              },
+            }),
+          });
+
+          assert(response.status === 202, `terminal failed should be accepted, got ${response.status}`);
+
+          const terminal = notices.find((n) => n.kind === "terminal" && n.sessionId === "sess-rfc18-err");
+          assert(Boolean(terminal), "terminal error notice missing");
+          assert(terminal?.effectiveAgent === "build", "effectiveAgent missing in error terminal");
+          assert(terminal?.effectiveModel === undefined, "effectiveModel should remain missing when upstream omitted it");
+
+          const rendered = formatAsyncSessionNotice(terminal!);
+          assert(rendered.includes("Sesión finalizada con error"), "error title missing");
+          assert(rendered.includes("🤖 Agente: build"), "error render missing effective agent");
+          assert(rendered.includes("🧠 Modelo: no disponible"), "error render should show model no disponible");
+        }
+      );
+
+      return "terminal-error-partial-ok";
+    })
+  );
+
+  results.push(
+    await runCase("S12", "CLI/PTY metadata derivation path", "missing effectiveModel renders no disponible and requestedAgent is used as effectiveAgent", async () => {
+      await verificationHarness(
+        {
+          fixtureName: "rfc18-cli-pty-missing-model",
+          webhookPortStart: 4224,
+          webhookPortEnd: 4225,
+          watchdogStaleAfterMs: 1,
+          watchdogMaxRetryCount: 2,
+        },
+        async ({ persistence, tempDir, receiver, registration, notices }) => {
+          await seedSessionFixture({
+            persistence,
+            tempDir,
+            projectId: "proj-rfc18-cli",
+            sessionId: "sess-rfc18-cli",
+            chatId: "7009",
+            taskId: "task-rfc18-cli",
+            watcherToken: registration.bearerToken,
+            watcherCallbackUrl: receiver.callbackUrl,
+          });
+
+          await persistence.runInTransaction(async (unit) => {
+            const existing = await unit.sessions.findById("sess-rfc18-cli");
+            if (!existing) return;
+            await unit.sessions.upsert({
+              ...existing,
+              requestedAgent: "plan",
+              requestedModel: "openai/gpt-5.3-codex",
+              effectiveAgent: undefined,
+              effectiveModel: undefined,
+            });
+          });
+
+          const response = await fetch(receiver.callbackUrl, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${registration.bearerToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              event: SESSION_EVENT_KIND.COMPLETED,
+              session_id: "sess-rfc18-cli",
+              timestamp: new Date().toISOString(),
+              data: {},
+            }),
+          });
+
+          assert(response.status === 202, `terminal should be accepted, got ${response.status}`);
+
+          const terminal = notices.find((n) => n.kind === "terminal" && n.sessionId === "sess-rfc18-cli");
+          assert(Boolean(terminal), "terminal cli/pty notice missing");
+          assert(terminal?.effectiveAgent === "plan", "effectiveAgent should derive from requestedAgent");
+          assert(terminal?.effectiveModel === undefined, "effectiveModel should stay unavailable when missing");
+
+          const rendered = formatAsyncSessionNotice(terminal!);
+          assert(rendered.includes("🤖 Agente: plan"), "render should include derived effective agent");
+          assert(rendered.includes("🧠 Modelo: no disponible"), "render should show explicit model no disponible");
+        }
+      );
+
+      return "cli-pty-no-model-ok";
+    })
+  );
+
+  results.push(
+    await runCase("S13", "Safe fallback when upstream omits effective metadata", "terminal render remains stable and prints no disponible for missing effective fields", async () => {
+      await verificationHarness(
+        {
+          fixtureName: "rfc18-upstream-omits-effective",
+          webhookPortStart: 4226,
+          webhookPortEnd: 4227,
+          watchdogStaleAfterMs: 1,
+          watchdogMaxRetryCount: 2,
+        },
+        async ({ persistence, tempDir, receiver, registration, notices }) => {
+          await seedSessionFixture({
+            persistence,
+            tempDir,
+            projectId: "proj-rfc18-empty",
+            sessionId: "sess-rfc18-empty",
+            chatId: "7010",
+            taskId: "task-rfc18-empty",
+            watcherToken: registration.bearerToken,
+            watcherCallbackUrl: receiver.callbackUrl,
+          });
+
+          const response = await fetch(receiver.callbackUrl, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${registration.bearerToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              event: SESSION_EVENT_KIND.COMPLETED,
+              session_id: "sess-rfc18-empty",
+              timestamp: new Date().toISOString(),
+            }),
+          });
+
+          assert(response.status === 202, `terminal without metadata should be accepted, got ${response.status}`);
+
+          const terminal = notices.find((n) => n.kind === "terminal" && n.sessionId === "sess-rfc18-empty");
+          assert(Boolean(terminal), "terminal notice missing for omitted effective metadata");
+          assert(terminal?.effectiveAgent === undefined, "effectiveAgent should remain undefined when omitted");
+          assert(terminal?.effectiveModel === undefined, "effectiveModel should remain undefined when omitted");
+
+          const rendered = formatAsyncSessionNotice(terminal!);
+          assert(rendered.includes("🤖 Agente: no disponible"), "render should show no disponible for missing agent");
+          assert(rendered.includes("🧠 Modelo: no disponible"), "render should show no disponible for missing model");
+        }
+      );
+
+      return "omitted-effective-safe-render-ok";
+    })
+  );
+
+  results.push(
+    await runCase("S14", "Template compact final metadata block", "rendered terminal block includes fixed metadata lines and requested→effective transitions", async () => {
+      const rendered = formatAsyncSessionNotice({
+        chatId: "7011",
+        kind: "terminal",
+        projectId: "proj-rfc18-template",
+        sessionId: "sess-rfc18-template",
+        summary: "OpenCode reportó un estado terminal.",
+        terminalSource: "webhook",
+        terminalCause: "completed",
+        taskId: "task-rfc18-template",
+        requestedAgent: "plan",
+        effectiveAgent: "build",
+        requestedModel: "openai/gpt-5.3-codex",
+        effectiveModel: "openai/gpt-4.1",
+      });
+
+      const lines = rendered.split("\n");
+      const agentLineIndex = lines.findIndex((line) => line.startsWith("🤖 Agente:"));
+      const modelLineIndex = lines.findIndex((line) => line.startsWith("🧠 Modelo:"));
+      const modelFallbackIndex = lines.findIndex((line) => line.startsWith("ℹ️ Fallback modelo:"));
+      const agentOverrideIndex = lines.findIndex((line) => line.startsWith("ℹ️ Override agente:"));
+
+      assert(agentLineIndex >= 0, "missing agent line in compact final block");
+      assert(modelLineIndex === agentLineIndex + 1, "model line should be contiguous after agent line");
+      assert(modelFallbackIndex === modelLineIndex + 1, "model fallback line should follow metadata lines");
+      assert(agentOverrideIndex === modelFallbackIndex + 1, "agent override line should follow fallback line");
+      assert(rendered.includes("openai/gpt-5.3-codex → openai/gpt-4.1"), "missing requested→effective model transition");
+      assert(rendered.includes("plan → build"), "missing requested→effective agent transition");
+
+      return "compact-final-block-ok";
+    })
+  );
+
+  results.push(
+    await runCase("S15", "Manual agent sync render", "agent-sync notice renders refreshed runtime metadata", async () => {
+      const rendered = formatAsyncSessionNotice({
+        chatId: "7012",
+        kind: "terminal",
+        projectId: "proj-sync",
+        sessionId: "sess-sync",
+        summary: "Drift detectado: Telegram refrescó metadata runtime.",
+        terminalSource: "watchdog",
+        terminalCause: "metadata-sync",
+        requestedAgent: "plan",
+        requestedModel: "gpt-5.3",
+        effectiveAgent: "build",
+        effectiveModel: "gpt-5.2",
+      });
+
+      assert(rendered.includes("Drift detectado"), "sync notice should surface drift copy");
+      assert(rendered.includes("🤖 Agente: build"), "sync notice should show effective agent");
+      assert(rendered.includes("🧠 Modelo: gpt-5.2"), "sync notice should show effective model");
+      return "manual-sync-render-ok";
+    })
   );
 
   results.push(

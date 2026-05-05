@@ -62,6 +62,10 @@ export interface Session {
   notificationSentAt?: string;
   continuityLostAt?: string;
   watchdogRetryCount?: number;
+  requestedAgent?: string;
+  requestedModel?: string;
+  effectiveAgent?: string;
+  effectiveModel?: string;
 }
 
 export interface ChatBinding {
@@ -109,6 +113,33 @@ export interface PendingPrompt {
   submittedInput?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export const SUPPORTED_AGENTS = {
+  BUILD: "build",
+  PLAN: "plan",
+  GENTLEMAN: "gentleman",
+  SDD_ORCHESTRATOR: "sdd-orchestrator",
+} as const;
+
+export type SupportedAgent = (typeof SUPPORTED_AGENTS)[keyof typeof SUPPORTED_AGENTS];
+
+export interface AgentSelection {
+  chatId: string;
+  projectId: string;
+  activeAgent: SupportedAgent;
+  updatedAt: string;
+}
+
+export interface ModelSelection {
+  chatId: string;
+  projectId: string;
+  activeModel: string;
+  updatedAt: string;
+}
+
+export function isSupportedAgent(value: string): value is SupportedAgent {
+  return Object.values(SUPPORTED_AGENTS).includes(value as SupportedAgent);
 }
 
 export const DANGEROUS_ACTION_CONFIRMATION_STATUS = {

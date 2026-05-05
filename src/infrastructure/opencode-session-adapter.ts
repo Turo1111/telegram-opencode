@@ -17,6 +17,7 @@ import {
 import { mapUpstreamFailureToAdapterError, normalizeRemoteSessionStatus } from "../application/remote-mappers";
 import { Config } from "../config";
 import { DomainError, ERROR_CODES, mapAdapterErrorToDomainError } from "../domain/errors";
+import { SupportedAgent } from "../domain/entities";
 import {
   OpenCodeHttpClient,
   OPEN_CODE_OPERATION_KINDS,
@@ -29,6 +30,7 @@ import {
   resolveCanonicalProjectPath,
   runSessionMessage,
   startSessionMessage,
+  listModels as listCliModels,
 } from "./opencode-cli";
 import { OPEN_CODE_ADAPTER_MODE } from "./opencode-adapter-mode";
 import {
@@ -59,9 +61,68 @@ interface SessionPayloadResponse {
   needsAttention?: boolean;
   message?: string;
   cancelMode?: string;
+  requestedAgent?: string;
+  requestedModel?: string;
+  effectiveAgent?: string;
+  effectiveModel?: string;
+  fallbackInfo?: {
+    kind?: string;
+    requestedAgent?: string;
+    effectiveAgent?: string;
+    requestedModel?: string;
+    effectiveModel?: string;
+  };
+}
+
+const MODEL_CATALOG_CACHE_TTL_MS = 30_000;
+
+interface ModelCatalogCacheEntry {
+  readonly models: ReadonlyArray<{ id: string; label?: string; source: "http" | "cli" | "pty" }>;
+  readonly fetchedAt: string;
+  readonly expiresAtMs: number;
+}
+
+function catalogCacheKey(input: { projectId: string; sessionId?: string; chatId: string }): string {
+  return `${input.chatId}::${input.projectId}::${input.sessionId ?? "-"}`;
+}
+
+function cacheCatalog(
+  cache: Map<string, ModelCatalogCacheEntry>,
+  key: string,
+  models: ReadonlyArray<{ id: string; label?: string; source: "http" | "cli" | "pty" }>,
+  nowIso: string
+): ModelCatalogCacheEntry {
+  const entry: ModelCatalogCacheEntry = {
+    models,
+    fetchedAt: nowIso,
+    expiresAtMs: Date.now() + MODEL_CATALOG_CACHE_TTL_MS,
+  };
+  cache.set(key, entry);
+  return entry;
+}
+
+function resolveCatalogFromCacheOnFailure(
+  cache: Map<string, ModelCatalogCacheEntry>,
+  key: string,
+  reason: "timeout" | "unavailable" | "unsupported" | "upstream"
+): import("../application/contracts").ModelCatalogResult {
+  const nowIso = new Date().toISOString();
+  const cached = cache.get(key);
+  if (!cached) {
+    return { ok: false, models: [], fetchedAt: nowIso, degraded: { reason, usingCache: false } };
+  }
+
+  const fresh = cached.expiresAtMs > Date.now();
+  if (fresh) {
+    return { ok: true, models: cached.models, fetchedAt: cached.fetchedAt, degraded: { reason, usingCache: true } };
+  }
+
+  return { ok: true, models: cached.models, fetchedAt: cached.fetchedAt, degraded: { reason, usingCache: true } };
 }
 
 export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
+  private readonly modelCatalogCache = new Map<string, ModelCatalogCacheEntry>();
+
   constructor(private readonly client: OpenCodeHttpClient) {}
 
   async resolveProject(input: {
@@ -140,6 +201,7 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
   async attachSession(input: {
     projectId: string;
     sessionId: string;
+    model?: string;
   }): Promise<Result<SessionState>> {
     try {
       const payload: SessionPayloadResponse = await this.client.post({
@@ -149,6 +211,7 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         payload: {
           projectId: input.projectId,
           sessionId: input.sessionId,
+          model: input.model,
         },
       });
 
@@ -156,11 +219,17 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         return err(mapAdapterResultError(sessionProjectMismatchError(input, payload)));
       }
 
-      return ok(toSessionState(payload, {
+      const state = toSessionState(payload, {
         fallbackProjectId: input.projectId,
         fallbackSessionId: input.sessionId,
         operation: "attachSession",
-      }));
+      });
+
+      return ok({
+        ...state,
+        requestedModel: input.model,
+        effectiveModel: input.model,
+      });
     } catch (error) {
       return err(mapAdapterResultError(mapOpenCodeError(error, "attachSession")));
     }
@@ -172,6 +241,8 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     message: string;
     chatId: string;
     watch?: SessionWatcherRegistration;
+    agent?: SupportedAgent;
+    model?: string;
   }): Promise<Result<SendResult>> {
     try {
       const payload: SessionPayloadResponse = await this.client.post({
@@ -185,6 +256,8 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
           chatId: input.chatId,
           webhookUrl: input.watch?.callbackUrl,
           webhookToken: input.watch?.bearerToken,
+          agent: input.agent,
+          model: input.model,
         },
       });
 
@@ -205,6 +278,11 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         needsAttention: payload.needsAttention ?? false,
         status: payload.status ? normalizeRemoteSessionStatus(payload.status) : undefined,
         state,
+        requestedAgent: payload.requestedAgent,
+        requestedModel: payload.requestedModel,
+        effectiveAgent: payload.effectiveAgent,
+        effectiveModel: payload.effectiveModel,
+        fallbackInfo: mapFallbackInfo(payload.fallbackInfo),
       });
     } catch (error) {
       return err(mapAdapterResultError(mapOpenCodeError(error, "sendMessage")));
@@ -217,6 +295,8 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     command: string;
     chatId: string;
     watch?: SessionWatcherRegistration;
+    agent?: SupportedAgent;
+    model?: string;
   }): Promise<Result<SendResult>> {
     try {
       const payload: SessionPayloadResponse = await this.client.post({
@@ -230,6 +310,8 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
           chatId: input.chatId,
           webhookUrl: input.watch?.callbackUrl,
           webhookToken: input.watch?.bearerToken,
+          agent: input.agent,
+          model: input.model,
         },
       });
 
@@ -250,9 +332,37 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         needsAttention: payload.needsAttention ?? false,
         status: payload.status ? normalizeRemoteSessionStatus(payload.status) : undefined,
         state,
+        requestedAgent: payload.requestedAgent,
+        requestedModel: payload.requestedModel,
+        effectiveAgent: payload.effectiveAgent,
+        effectiveModel: payload.effectiveModel,
+        fallbackInfo: mapFallbackInfo(payload.fallbackInfo),
       });
     } catch (error) {
       return err(mapAdapterResultError(mapOpenCodeError(error, "runCommand")));
+    }
+  }
+
+  async listModels(input: { projectId: string; sessionId?: string; chatId: string }): Promise<Result<import("../application/contracts").ModelCatalogResult>> {
+    const key = catalogCacheKey(input);
+    try {
+      const payload: { models?: Array<{ id?: string; label?: string }>; items?: Array<{ id?: string; label?: string }> } = await this.client.post({
+        endpoint: "/opencode/models",
+        operationName: "listModels",
+        operationKind: OPEN_CODE_OPERATION_KINDS.CONTROL,
+        payload: { projectId: input.projectId, sessionId: input.sessionId, chatId: input.chatId },
+      });
+      const raw = payload.models ?? payload.items ?? [];
+      const models = raw.filter((m) => typeof m.id === "string" && m.id.trim()).map((m) => ({ id: String(m.id), label: typeof m.label === "string" ? m.label : undefined, source: "http" as const }));
+      const nowIso = new Date().toISOString();
+      cacheCatalog(this.modelCatalogCache, key, models, nowIso);
+      return ok({ ok: true, models, fetchedAt: nowIso });
+    } catch (error) {
+      const mapped = mapOpenCodeError(error, "listModels");
+      if (mapped.code === ADAPTER_ERROR_CODES.UNSUPPORTED || mapped.code === ADAPTER_ERROR_CODES.UNAVAILABLE || mapped.code === ADAPTER_ERROR_CODES.TIMEOUT) {
+        return ok(resolveCatalogFromCacheOnFailure(this.modelCatalogCache, key, mapped.code === ADAPTER_ERROR_CODES.TIMEOUT ? "timeout" : mapped.code === ADAPTER_ERROR_CODES.UNSUPPORTED ? "unsupported" : "unavailable"));
+      }
+      return err(mapAdapterResultError(mapped));
     }
   }
 
@@ -384,6 +494,7 @@ export class HttpOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
 
 export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
   private readonly projectDirById = new Map<string, string>();
+  private readonly modelCatalogCache = new Map<string, ModelCatalogCacheEntry>();
 
   constructor(
     private readonly config: Config,
@@ -392,11 +503,13 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       readonly resolveCanonicalProjectPath: typeof resolveCanonicalProjectPath;
       readonly runSessionMessage: typeof runSessionMessage;
       readonly startSessionMessage: typeof startSessionMessage;
+      readonly listModels?: typeof listCliModels;
     } = {
       listSessions,
       resolveCanonicalProjectPath,
       runSessionMessage,
       startSessionMessage,
+      listModels: listCliModels,
     }
   ) {}
 
@@ -443,9 +556,11 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
   async attachSession(input: {
     projectId: string;
     sessionId: string;
+    model?: string;
     }): Promise<Result<SessionState>> {
     try {
-      const sessions = await this.cliOps.listSessions(this.config.openCodeControlTimeoutMs);
+      const dir = await this.resolveProjectDir(input.projectId);
+      const sessions = await this.cliOps.listSessions(this.config.openCodeControlTimeoutMs, dir);
       const match = sessions.find((item) => item.id === input.sessionId);
       if (!match) {
         return err(
@@ -476,6 +591,8 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         projectId: input.projectId,
         status: "idle",
         updatedAt: match.updatedAt,
+        requestedModel: input.model,
+        effectiveModel: input.model,
       });
     } catch (error) {
       return err(mapAdapterResultError(mapCliError(error, "attachSession")));
@@ -488,6 +605,8 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     message: string;
     chatId: string;
     watch?: SessionWatcherRegistration;
+    agent?: SupportedAgent;
+    model?: string;
   }): Promise<Result<SendResult>> {
     try {
       const dir = await this.resolveProjectDir(input.projectId);
@@ -495,12 +614,18 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         sessionId: input.sessionId,
         dir,
         message: input.message,
+        agent: input.agent,
+        model: input.model,
       });
 
       return ok({
         message: "",
         reply: "Mensaje enviado a OpenCode. Te respondo por acá cuando llegue la salida del mirror.",
         needsAttention: false,
+        requestedAgent: input.agent,
+        requestedModel: input.model,
+        effectiveAgent: input.agent,
+        effectiveModel: input.model,
         state: {
           sessionId: input.sessionId,
           projectId: input.projectId,
@@ -519,6 +644,8 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     command: string;
     chatId: string;
     watch?: SessionWatcherRegistration;
+    agent?: SupportedAgent;
+    model?: string;
   }): Promise<Result<SendResult>> {
     return this.sendMessage({
       projectId: input.projectId,
@@ -526,7 +653,26 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       message: input.command,
       chatId: input.chatId,
       watch: input.watch,
+      agent: input.agent,
+      model: input.model,
     });
+  }
+
+  async listModels(input: { projectId: string; sessionId?: string; chatId: string }): Promise<Result<import("../application/contracts").ModelCatalogResult>> {
+    const key = catalogCacheKey(input);
+    try {
+      const models = await (this.cliOps.listModels ?? listCliModels)(this.config.openCodeControlTimeoutMs);
+      const normalized = models.map((m) => ({ id: m.id, label: m.label, source: "cli" as const }));
+      const nowIso = new Date().toISOString();
+      cacheCatalog(this.modelCatalogCache, key, normalized, nowIso);
+      return ok({ ok: true, models: normalized, fetchedAt: nowIso });
+    } catch (error) {
+      const mapped = mapCliError(error, "listModels");
+      if (mapped.code === ADAPTER_ERROR_CODES.UNSUPPORTED || mapped.code === ADAPTER_ERROR_CODES.UNAVAILABLE || mapped.code === ADAPTER_ERROR_CODES.TIMEOUT) {
+        return ok(resolveCatalogFromCacheOnFailure(this.modelCatalogCache, key, mapped.code === ADAPTER_ERROR_CODES.TIMEOUT ? "timeout" : mapped.code === ADAPTER_ERROR_CODES.UNSUPPORTED ? "unsupported" : "unavailable"));
+      }
+      return err(mapAdapterResultError(mapped));
+    }
   }
 
   async getSessionState(input: {
@@ -534,7 +680,8 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     sessionId: string;
     }): Promise<Result<SessionState>> {
     try {
-      const sessions = await this.cliOps.listSessions(this.config.openCodeControlTimeoutMs);
+      const dir = await this.resolveProjectDir(input.projectId);
+      const sessions = await this.cliOps.listSessions(this.config.openCodeControlTimeoutMs, dir);
       const match = sessions.find((item) => item.id === input.sessionId);
 
       if (!match) {
@@ -650,15 +797,20 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
 
 export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
   private readonly projectDirById = new Map<string, string>();
+  private readonly configuredAgentBySessionId = new Map<string, SupportedAgent>();
+  private readonly configuredModelBySessionId = new Map<string, string>();
+  private readonly modelCatalogCache = new Map<string, ModelCatalogCacheEntry>();
 
   constructor(
     private readonly config: Config,
     private readonly cliOps: {
       readonly listSessions: typeof listSessions;
       readonly resolveCanonicalProjectPath: typeof resolveCanonicalProjectPath;
+      readonly listModels?: typeof listCliModels;
     } = {
       listSessions,
       resolveCanonicalProjectPath,
+      listModels: listCliModels,
     },
     private readonly tmuxHostOps: {
       readonly ensureHostSession: typeof ensureHostSession;
@@ -711,7 +863,7 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       const canonicalProjectPath = await this.cliOps.resolveCanonicalProjectPath(input.rootPath);
       this.projectDirById.set(input.projectId, canonicalProjectPath);
 
-      const before = await this.cliOps.listSessions(input.timeoutMs);
+      const before = await this.cliOps.listSessions(input.timeoutMs, canonicalProjectPath);
       temporarySessionName = await (this.tmuxHostOps.startTemporaryBootstrapSession ?? startTemporaryBootstrapSession)({
         token: randomUUID().replace(/-/gu, ""),
         dir: canonicalProjectPath,
@@ -723,7 +875,7 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         before,
         projectPath: canonicalProjectPath,
         timeoutMs: input.timeoutMs,
-        listSessionsFn: this.cliOps.listSessions,
+        listSessionsFn: (timeoutMs: number) => this.cliOps.listSessions(timeoutMs, canonicalProjectPath),
         resolveCanonicalProjectPathFn: this.cliOps.resolveCanonicalProjectPath,
       });
 
@@ -761,9 +913,11 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
   async attachSession(input: {
     projectId: string;
     sessionId: string;
+    model?: string;
   }): Promise<Result<SessionState>> {
     try {
-      const sessions = await this.cliOps.listSessions(this.config.openCodeControlTimeoutMs);
+      const dir = await this.resolveProjectDir(input.projectId);
+      const sessions = await this.cliOps.listSessions(this.config.openCodeControlTimeoutMs, dir);
       const match = sessions.find((item) => item.id === input.sessionId);
       if (!match) {
         return err(
@@ -785,6 +939,7 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         opencodeSessionId: input.sessionId,
         dir: canonicalPath,
         timeoutMs: this.config.openCodeControlTimeoutMs,
+        model: input.model,
       });
 
       return ok({
@@ -792,9 +947,70 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         projectId: input.projectId,
         status: "idle",
         updatedAt: match.updatedAt,
+        requestedModel: input.model,
+        effectiveModel: input.model,
       });
     } catch (error) {
       return err(mapAdapterResultError(mapPtyError(error, "attachSession")));
+    }
+  }
+
+  async configureSessionAgent(input: {
+    projectId: string;
+    sessionId: string;
+    agent: SupportedAgent;
+  }): Promise<Result<{ projectId: string; sessionId: string; agent: SupportedAgent }>> {
+    try {
+      await this.ensureSessionHostReady({
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        agent: input.agent,
+      });
+
+      this.configuredAgentBySessionId.set(input.sessionId, input.agent);
+
+      return ok({
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        agent: input.agent,
+      });
+    } catch (error) {
+      return err(mapAdapterResultError(mapPtyError(error, "configureSessionAgent")));
+    }
+  }
+
+  async configureSessionModel(input: {
+    projectId: string;
+    sessionId: string;
+    model: string;
+  }): Promise<Result<{ projectId: string; sessionId: string; model: string }>> {
+    try {
+      await this.ensureSessionHostReady({
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        model: input.model,
+      });
+
+      this.configuredModelBySessionId.set(input.sessionId, input.model);
+      return ok(input);
+    } catch (error) {
+      return err(mapAdapterResultError(mapPtyError(error, "configureSessionModel")));
+    }
+  }
+
+  async listModels(input: { projectId: string; sessionId?: string; chatId: string }): Promise<Result<import("../application/contracts").ModelCatalogResult>> {
+    const key = catalogCacheKey(input);
+    try {
+      const models = await (this.cliOps.listModels ?? listCliModels)(this.config.openCodeControlTimeoutMs);
+      const out = models.map((item) => ({ id: item.id, label: item.label, source: "pty" as const }));
+      if (out.length === 0) {
+        return ok(resolveCatalogFromCacheOnFailure(this.modelCatalogCache, key, "unsupported"));
+      }
+      const nowIso = new Date().toISOString();
+      cacheCatalog(this.modelCatalogCache, key, out, nowIso);
+      return ok({ ok: true, models: out, fetchedAt: nowIso });
+    } catch {
+      return ok(resolveCatalogFromCacheOnFailure(this.modelCatalogCache, key, "unavailable"));
     }
   }
 
@@ -804,12 +1020,30 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     message: string;
     chatId: string;
     watch?: SessionWatcherRegistration;
+    agent?: SupportedAgent;
+    model?: string;
   }): Promise<Result<SendResult>> {
     try {
+      const shouldForceReconfigureAgent = !input.agent
+        ? false
+        : this.configuredAgentBySessionId.get(input.sessionId) !== input.agent;
+      const shouldForceReconfigureModel = !input.model
+        ? false
+        : this.configuredModelBySessionId.get(input.sessionId) !== input.model;
+
       await this.ensureSessionHostReady({
         projectId: input.projectId,
         sessionId: input.sessionId,
+        agent: shouldForceReconfigureAgent ? input.agent : undefined,
+        model: shouldForceReconfigureModel ? input.model : undefined,
       });
+
+      if (input.agent) {
+        this.configuredAgentBySessionId.set(input.sessionId, input.agent);
+      }
+      if (input.model) {
+        this.configuredModelBySessionId.set(input.sessionId, input.model);
+      }
 
       await this.tmuxHostOps.sendInput({
         opencodeSessionId: input.sessionId,
@@ -822,6 +1056,10 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
         reply:
           "Mensaje inyectado en sesión PTY/tmux. Te respondo por acá cuando llegue la salida del mirror.",
         needsAttention: false,
+        requestedAgent: input.agent,
+        requestedModel: input.model,
+        effectiveAgent: input.agent,
+        effectiveModel: input.model,
         state: {
           sessionId: input.sessionId,
           projectId: input.projectId,
@@ -840,6 +1078,8 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     command: string;
     chatId: string;
     watch?: SessionWatcherRegistration;
+    agent?: SupportedAgent;
+    model?: string;
   }): Promise<Result<SendResult>> {
     return this.sendMessage({
       projectId: input.projectId,
@@ -847,15 +1087,18 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       message: input.command,
       chatId: input.chatId,
       watch: input.watch,
+      agent: input.agent,
+      model: input.model,
     });
   }
 
   async getSessionState(input: {
     projectId: string;
     sessionId: string;
-  }): Promise<Result<SessionState>> {
+    }): Promise<Result<SessionState>> {
     try {
-      const sessions = await this.cliOps.listSessions(this.config.openCodeControlTimeoutMs);
+      const dir = await this.resolveProjectDir(input.projectId);
+      const sessions = await this.cliOps.listSessions(this.config.openCodeControlTimeoutMs, dir);
       const match = sessions.find((item) => item.id === input.sessionId);
       if (!match) {
         return err(
@@ -971,12 +1214,14 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
     }
   }
 
-  private async ensureSessionHostReady(input: { projectId: string; sessionId: string }): Promise<void> {
+  private async ensureSessionHostReady(input: { projectId: string; sessionId: string; agent?: SupportedAgent; model?: string }): Promise<void> {
     const dir = await this.resolveProjectDir(input.projectId);
     await this.tmuxHostOps.ensureHostSession({
       opencodeSessionId: input.sessionId,
       dir,
       timeoutMs: this.config.openCodeControlTimeoutMs,
+      agent: input.agent,
+      model: input.model,
     });
   }
 
@@ -1074,6 +1319,20 @@ function toSessionState(
     taskId: payload.taskId,
     updatedAt: payload.updatedAt,
   };
+}
+
+function mapFallbackInfo(value: SessionPayloadResponse["fallbackInfo"]) {
+  if (!value || (value.kind !== "model-fallback" && value.kind !== "agent-override" && value.kind !== "multiple")) {
+    return undefined;
+  }
+
+  return {
+    kind: value.kind,
+    requestedAgent: value.requestedAgent,
+    effectiveAgent: value.effectiveAgent,
+    requestedModel: value.requestedModel,
+    effectiveModel: value.effectiveModel,
+  } as const;
 }
 
 function sessionProjectMismatchError(

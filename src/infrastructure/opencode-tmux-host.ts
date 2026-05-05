@@ -1,9 +1,12 @@
 import { execFile } from "node:child_process";
+import { SupportedAgent } from "../domain/entities";
 
 export interface EnsureTmuxHostSessionInput {
   readonly opencodeSessionId: string;
   readonly dir: string;
   readonly timeoutMs: number;
+  readonly agent?: SupportedAgent;
+  readonly model?: string;
 }
 
 export interface SendTmuxInputInput {
@@ -45,17 +48,65 @@ export class OpenCodeTmuxHostError extends Error {
   }
 }
 
+const hostAgentBySessionName = new Map<string, SupportedAgent>();
+const hostModelBySessionName = new Map<string, string>();
+
 export async function ensureHostSession(input: EnsureTmuxHostSessionInput): Promise<void> {
   const sessionName = toTmuxSessionName(input.opencodeSessionId);
+  const exists = await hasSession({ sessionName, timeoutMs: input.timeoutMs });
 
-  if (await hasSession({ sessionName, timeoutMs: input.timeoutMs })) {
+  const knownAgent = hostAgentBySessionName.get(sessionName);
+  const knownModel = hostModelBySessionName.get(sessionName);
+  const agentNeedsReconfigure = Boolean(input.agent) && knownAgent !== input.agent;
+  const modelNeedsReconfigure = Boolean(input.model) && knownModel !== input.model;
+
+  if (exists && !agentNeedsReconfigure && !modelNeedsReconfigure) {
+    if (input.agent && knownAgent === undefined) {
+      hostAgentBySessionName.set(sessionName, input.agent);
+    }
+    if (input.model && knownModel === undefined) {
+      hostModelBySessionName.set(sessionName, input.model);
+    }
     return;
   }
 
+  if (exists) {
+    await runTmux({
+      args: ["kill-session", "-t", sessionName],
+      timeoutMs: input.timeoutMs,
+    });
+  }
+
+  if (!input.agent) {
+    hostAgentBySessionName.delete(sessionName);
+  }
+  if (!input.model) {
+    hostModelBySessionName.delete(sessionName);
+  }
+
+  const args = buildHostSessionArgs({
+    sessionName,
+    dir: input.dir,
+    opencodeSessionId: input.opencodeSessionId,
+    agent: input.agent,
+    model: input.model,
+  });
   await runTmux({
-    args: ["new-session", "-d", "-s", sessionName, "-c", input.dir, "opencode", "--session", input.opencodeSessionId],
+    args,
     timeoutMs: input.timeoutMs,
   });
+
+  await waitForSessionReady({
+    sessionName,
+    timeoutMs: input.timeoutMs,
+  });
+
+  if (input.agent) {
+    hostAgentBySessionName.set(sessionName, input.agent);
+  }
+  if (input.model) {
+    hostModelBySessionName.set(sessionName, input.model);
+  }
 }
 
 export async function hasSessionByOpenCodeSessionId(input: {
@@ -87,6 +138,8 @@ export async function killSessionByName(input: KillTmuxSessionByNameInput): Prom
     args: ["kill-session", "-t", input.sessionName],
     timeoutMs: input.timeoutMs,
   });
+  hostAgentBySessionName.delete(input.sessionName);
+  hostModelBySessionName.delete(input.sessionName);
 }
 
 export async function sendInput(input: SendTmuxInputInput): Promise<void> {
@@ -150,6 +203,23 @@ export function toBootstrapTmuxSessionName(token: string): string {
   return `tgoc_boot_${sanitized}`;
 }
 
+export function buildHostSessionArgs(input: {
+  readonly sessionName: string;
+  readonly dir: string;
+  readonly opencodeSessionId: string;
+  readonly agent?: SupportedAgent;
+  readonly model?: string;
+}): readonly string[] {
+  const args = ["new-session", "-d", "-s", input.sessionName, "-c", input.dir, "opencode", "--session", input.opencodeSessionId];
+  if (input.agent) {
+    args.push("--agent", input.agent);
+  }
+  if (input.model) {
+    args.push("--model", input.model);
+  }
+  return args;
+}
+
 async function hasSession(input: { readonly sessionName: string; readonly timeoutMs: number }): Promise<boolean> {
   try {
     await runTmux({
@@ -163,6 +233,27 @@ async function hasSession(input: { readonly sessionName: string; readonly timeou
     }
     throw error;
   }
+}
+
+async function waitForSessionReady(input: { readonly sessionName: string; readonly timeoutMs: number }): Promise<void> {
+  const deadline = Date.now() + Math.max(50, input.timeoutMs);
+  while (Date.now() <= deadline) {
+    const remaining = deadline - Date.now();
+    const probeTimeout = Math.max(50, Math.min(remaining, 250));
+    if (await hasSession({ sessionName: input.sessionName, timeoutMs: probeTimeout })) {
+      return;
+    }
+    await sleep(75);
+  }
+
+  throw new OpenCodeTmuxHostError("timeout", "tmux session no quedó lista tras reinicio", {
+    sessionName: input.sessionName,
+    timeoutMs: input.timeoutMs,
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function runTmux(input: { readonly args: readonly string[]; readonly timeoutMs: number }): Promise<string> {

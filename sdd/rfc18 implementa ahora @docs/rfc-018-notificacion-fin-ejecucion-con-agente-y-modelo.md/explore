@@ -1,0 +1,56 @@
+## Exploration: RFC-018 notificación de fin de ejecución con agente y modelo
+
+### Current State
+- Flujo `sendText`: `adapters/telegram/router.handleText` -> `useCases.sendText` -> `OpenCodeSessionAdapter.sendMessage`.
+- Flujo `runSessionCommand`: existe en `useCases`, pero en router `/run` está deprecado en PTY-only; igual mantiene contrato y paths legacy.
+- Render Telegram síncrono usa `formatSendSuccess` (texto inmediato de respuesta/ack). No bloque metadata agente/modelo.
+- Render Telegram asíncrono de fin ejecución sale de watcher: `SessionWatcherService` emite `AsyncSessionNotice(kind=TERMINAL)` y `templates.formatAsyncSessionNotice` arma cierre con summary/task/origen/causa.
+- En modos CLI/PTy la salida real llega por mirror (`opencode-cli-mirror-service`) y por watcher terminal; hoy mirror envía texto puro del assistant sin metadata.
+
+### Affected Areas
+- `src/application/contracts.ts` — `SendResult`/`AsyncSessionNotice`/adapter contract: faltan campos `effectiveAgent`, `effectiveModel`, `fallbackInfo`.
+- `src/application/use-cases.ts` — mapea `SendResult` a `SendTextOutput`/`RunSessionCommandOutput`; debe propagar metadata.
+- `src/application/session-watcher-service.ts` — hoy solo extrae `summary` de `event.data`; punto natural para extraer metadata terminal real.
+- `src/infrastructure/opencode-session-adapter.ts` — fuentes metadata por modo:
+  - HTTP: posible desde payload upstream (si endpoint lo devuelve).
+  - CLI/PTy: dispatch local conoce `agent` solicitado; modelo efectivo no disponible en ack actual.
+- `src/adapters/telegram/templates.ts` — `formatSendSuccess` y `formatAsyncSessionNotice` deben renderizar bloque final compacto y consistente éxito/error.
+- `src/adapters/telegram/router.ts` — usa template sendText; si se decide mostrar metadata también en respuesta síncrona, toca este punto.
+- `src/application/opencode-cli-mirror-service.ts` — mirror no lleva metadata estructurada; limitación para “valor efectivo” salvo enrich vía watcher/store.
+
+### Approaches
+1. **Terminal-first metadata (recomendada)** — Mostrar metadata en notificación terminal (`AsyncSessionNotice`) obtenida desde evento real o estado persistido.
+   - Pros: refleja ejecución real; cubre éxito/error; alinea RFC “al finalizar”.
+   - Cons: depende que upstream/webhook publique metadata; en CLI/PTy puede faltar modelo.
+   - Effort: Medium.
+
+2. **Ack-time metadata** — Mostrar metadata en respuesta inmediata de `sendText/runCommand` con lo solicitado/configurado.
+   - Pros: feedback instantáneo; fácil en CLI/PTy para agente.
+   - Cons: puede mentir sobre efectivo final; no cubre fallback tardío.
+   - Effort: Low.
+
+3. **Híbrido (ack + terminal authoritative)** — Ack preliminar + cierre terminal definitivo.
+   - Pros: UX rápida + auditabilidad correcta.
+   - Cons: más ruido; más cambios en templates y contratos.
+   - Effort: Medium/High.
+
+### Recommendation
+Aplicar **Approach 1** con fallback controlado:
+- Fuente principal: metadata en `SessionEvent.data` terminal (`effectiveAgent`, `effectiveModel`, `fallbackInfo`).
+- Fuente secundaria:
+  - `effectiveAgent`: en CLI/PTy usar agente enviado en `sendMessage/runCommand` si terminal no trae dato.
+  - `effectiveModel`: solo si upstream lo informa (HTTP o webhook); no inventar.
+- Render único en `formatAsyncSessionNotice` para terminal success/error, manteniendo consistencia UX.
+
+### Risks
+- Upstream actual puede no enviar metadata terminal -> cobertura parcial hasta contrato backend.
+- CLI/PTy no exponen modelo efectivo por ack/mirror actual.
+- Riesgo drift entre “agente configurado Telegram” y “agente efectivo runtime” si usuario cambia en consola.
+- Incremento de longitud de mensaje Telegram (límite 4096, chunking ya existente mitiga).
+
+### Ready for Proposal
+Yes — con alcance explícito por fase:
+1) cambio contrato interno TS,
+2) extracción metadata desde watcher event data,
+3) render Telegram terminal,
+4) fallback “no disponible” cuando no hay metadata efectiva.
