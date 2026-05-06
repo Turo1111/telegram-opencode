@@ -472,6 +472,8 @@ export interface LocalTerminalLauncher {
     readonly sessionId: string;
     readonly tmuxSessionName: string;
   }): Promise<AttachLocalLaunchResult>;
+  getManualCommand?(sessionName: string): string;
+  getEnvironmentLabel?(): string;
 }
 
 export interface PersistenceUnit {

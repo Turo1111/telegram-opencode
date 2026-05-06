@@ -114,7 +114,7 @@ export interface TelegramRouterDeps {
 }
 
 const CLI_CANCEL_UNSUPPORTED_GUIDANCE =
-  "En modo CLI no está disponible /cancel. Gestioná la interrupción desde tu terminal OpenCode en PC/WSL.";
+  "En modo CLI no está disponible /cancel. Gestioná la interrupción desde tu terminal OpenCode en tu terminal local.";
 
 export const TELEGRAM_ROUTER_AUTH_SOURCE = {
   HANDLERS: "handlers",

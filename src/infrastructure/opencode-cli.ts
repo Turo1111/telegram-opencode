@@ -348,7 +348,7 @@ async function runOpenCodeCli(input: OpenCodeCliCommandInput): Promise<OpenCodeC
         reject(
           new OpenCodeCliError(
             "not-installed",
-            "No se encontró el binario 'opencode' en PATH. Instalalo y ejecutalo desde PC/WSL.",
+            "No se encontró el binario 'opencode' en PATH. Instalalo y ejecutalo desde tu terminal.",
             {
               args: input.args,
             }
@@ -544,7 +544,7 @@ async function spawnOpenCodeCli(input: {
         reject(
           new OpenCodeCliError(
             "not-installed",
-            "No se encontró el binario 'opencode' en PATH. Instalalo y ejecutalo desde PC/WSL.",
+            "No se encontró el binario 'opencode' en PATH. Instalalo y ejecutalo desde tu terminal.",
             {
               args: input.args,
             }

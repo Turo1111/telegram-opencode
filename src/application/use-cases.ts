@@ -1864,7 +1864,9 @@ function shouldShowAgent(agentId: string): boolean {
         });
 
         if (!tmuxCheck.exists) {
-          const manualCommand = `wsl.exe bash -lc 'tmux attach -t ${tmuxCheck.tmuxSessionName}'`;
+          const manualCommand = deps.localTerminalLauncher.getManualCommand?.(
+            tmuxCheck.tmuxSessionName
+          ) ?? `tmux attach -t ${tmuxCheck.tmuxSessionName}`;
           const outcome = await repository.recordExecutionOutcome({
             confirmationId: confirmed.confirmationId,
             executionResult: ATTACH_LOCAL_EXECUTION_RESULT.FAILED,

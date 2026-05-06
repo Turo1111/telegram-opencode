@@ -168,6 +168,12 @@ export const LOCAL_TERMINAL_LAUNCHER = {
   WT: "wt",
   POWERSHELL: "powershell",
   MANUAL_FALLBACK: "manual-fallback",
+  GNOME_TERMINAL: "gnome-terminal",
+  KONSOLE: "konsole",
+  X_TERMINAL_EMULATOR: "x-terminal-emulator",
+  TERMINAL_APP: "terminal-app",
+  ITERM: "iterm",
+  BASH: "bash",
 } as const;
 
 export type LocalTerminalLauncherKind =

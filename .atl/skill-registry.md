@@ -1,6 +1,6 @@
 # Skill Registry
 
-_Last updated: 2026-05-04_
+_Last updated: 2026-05-06_
 
 **Delegator use only.** Resolve matching skills here, inject compact rules into sub-agent prompts.
 
@@ -34,16 +34,30 @@ _Last updated: 2026-05-04_
 | Playwright E2E patterns and selectors. | playwright | /home/matias/.config/opencode/skills/playwright/SKILL.md |
 | Pytest fixtures, mocking, markers. | pytest | /home/matias/.config/opencode/skills/pytest/SKILL.md |
 | React 19 + React Compiler patterns. | react-19 | /home/matias/.config/opencode/skills/react-19/SKILL.md |
+| Spec-Driven Development — create change proposals. | sdd-propose | /home/matias/.config/opencode/skills/sdd-propose/SKILL.md |
+| Spec-Driven Development — explore/think. | sdd-explore | /home/matias/.config/opencode/skills/sdd-explore/SKILL.md |
+| Spec-Driven Development — write specs. | sdd-spec | /home/matias/.config/opencode/skills/sdd-spec/SKILL.md |
+| Spec-Driven Development — create tasks. | sdd-tasks | /home/matias/.config/opencode/skills/sdd-tasks/SKILL.md |
+| Spec-Driven Development — create design docs. | sdd-design | /home/matias/.config/opencode/skills/sdd-design/SKILL.md |
+| Spec-Driven Development — implement tasks. | sdd-apply | /home/matias/.config/opencode/skills/sdd-apply/SKILL.md |
+| Spec-Driven Development — verify implementation. | sdd-verify | /home/matias/.config/opencode/skills/sdd-verify/SKILL.md |
+| Spec-Driven Development — archive changes. | sdd-archive | /home/matias/.config/opencode/skills/sdd-archive/SKILL.md |
+| Spec-Driven Development — onboard walkthrough. | sdd-onboard | /home/matias/.config/opencode/skills/sdd-onboard/SKILL.md |
+| Spec-Driven Development — init project. | sdd-init | /home/matias/.config/opencode/skills/sdd-init/SKILL.md |
 | Create new AI skills from spec. | skill-creator | /home/matias/.config/opencode/skills/skill-creator/SKILL.md |
+| Update skill registry for project. | skill-registry | /home/matias/.config/opencode/skills/skill-registry/SKILL.md |
 | Tailwind CSS 4 patterns and constraints. | tailwind-4 | /home/matias/.config/opencode/skills/tailwind-4/SKILL.md |
 | Strict TypeScript patterns and generics. | typescript | /home/matias/.config/opencode/skills/typescript/SKILL.md |
 | Zod 4 validation patterns. | zod-4 | /home/matias/.config/opencode/skills/zod-4/SKILL.md |
 | Zustand 5 state management patterns. | zustand-5 | /home/matias/.config/opencode/skills/zustand-5/SKILL.md |
+| Spec-Driven Development — init (project-level). | sdd-init | /mnt/d/Proyectos/telegram-opencode/.claude/skills/sdd-init/SKILL.md |
 
 ## Project Conventions
 
 | File | Path | Notes |
 |------|------|-------|
-| AGENTS.md | /mnt/d/Proyectos/telegram-opencode/AGENTS.md | Project conventions |
+| AGENTS.md | /mnt/d/Proyectos/telegram-opencode/AGENTS.md | Project conventions: stack, scripts, quirks, testing |
+| CHANGELOG.md | /mnt/d/Proyectos/telegram-opencode/CHANGELOG.md | RFC closure gate — must update on RFC completion |
+| README.md | /mnt/d/Proyectos/telegram-opencode/README.md | Full project docs, commands, troubleshooting |
 
 Read listed convention files for repo-specific rules.

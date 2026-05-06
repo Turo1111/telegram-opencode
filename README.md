@@ -53,6 +53,12 @@ No hay magia: hay un adaptador de entrada (Telegram), una capa de aplicación, p
 - `opencode` disponible en `PATH`
 - `tmux` disponible en `PATH`
 
+  **Windows:** via WSL (Ubuntu), Git Bash, MSYS2 o Cygwin.
+  **Linux:** `apt install tmux` / `pacman -S tmux` / `dnf install tmux`.
+  **macOS:** `brew install tmux`.
+
+  tmux es OBLIGATORIO. No hay soporte de sesiones PTY sin tmux.
+
 ### Requisito importante de paths
 
 La ruta del proyecto debe existir y ser visible IGUAL para Node y para OpenCode.
@@ -104,7 +110,7 @@ LOCALE=es
 2. Obtené tu **Telegram `from.id`**.
 3. Configurá `.env` con `TELEGRAM_BOT_TOKEN`, `ALLOWED_USER_ID` y `OPEN_CODE_ADAPTER=pty`.
 4. Instalá dependencias con `npm install`.
-5. Abrí o continuá una sesión real de OpenCode desde tu terminal, o usá `/new <mensaje inicial>` desde Telegram después de elegir proyecto.
+5. Abrí o continuá una sesión real de OpenCode desde tu terminal (Linux/macOS nativo, WSL, Git Bash, etc.), o usá `/new <mensaje inicial>` desde Telegram después de elegir proyecto.
 6. Corré el bot:
 
 ```bash
@@ -187,19 +193,24 @@ Si ya conocés el `sessionId`, podés vincularlo manualmente con:
 🟢 Sesión vinculada
 ```
 
-## Adjuntarte desde PC a la misma sesión
+## Adjuntarte desde tu terminal local a la misma sesión
 
-El nombre de la sesión `tmux` queda así:
+El nombre de la sesión `tmux` sigue el formato:
 
 ```bash
 tmux attach -t tgoc_<session_id_sanitized>
 ```
 
-Ejemplo:
+El comando exacto depende de tu plataforma:
 
-```bash
-tmux attach -t tgoc_mi-session-123
-```
+| Plataforma | Comando |
+|------------|---------|
+| **Windows + WSL** | `wsl.exe bash -lc 'tmux attach -t tgoc_<id>'` |
+| **Windows + Git Bash/MSYS2** | `bash.exe -lc 'tmux attach -t tgoc_<id>'` |
+| **Linux nativo** | `tmux attach -t tgoc_<id>` |
+| **macOS** | `tmux attach -t tgoc_<id>` |
+
+También podés usar `/attach-local` desde Telegram (si está habilitado) para que el bot abra la terminal automáticamente.
 
 ## Scripts útiles
 
@@ -270,13 +281,13 @@ Las causas más comunes son:
 - la sesión existe pero pertenece a otro path/proyecto;
 - la sesión no trae un path confiable y el bot la excluye por seguridad.
 
-### El proyecto no coincide en WSL
+### El proyecto no coincide (WSL / Windows / Linux)
 
-Usá rutas WSL/Linux reales, por ejemplo:
+Usá rutas que existan y sean visibles tanto para Node.js como para OpenCode.
 
-```text
-/mnt/d/Proyectos/telegram-opencode
-```
+**WSL:** rutas Linux, ej: `/home/user/proyecto` o `/mnt/d/Proyectos/mi-proyecto`.  
+**Windows (Git Bash/MSYS2):** rutas Windows con slash, ej: `/c/Users/tu/Documentos/mi-proyecto`.  
+**Linux/macOS nativo:** rutas nativas del sistema.
 
 ### Usuario no autorizado
 
@@ -310,6 +321,25 @@ La prioridad es continuidad operativa.
 - `mock/` — artefactos legacy de mock local
 - `docs/` — PRD, RFCs y runbooks
 - `data/` — estado local y artefactos generados
+
+## Roadmap
+
+### RFC-022 — Project Registry
+Catálogo persistente de proyectos. Comandos `/projects`, selección por alias, registro automático al usar `/project`.
+
+### RFC-023 — Interrupción de sesión desde Telegram
+Completar `/cancel` end-to-end con botón inline "Cancelar" en tareas running, confirmación, feedback real.
+
+### RFC-024 — Reanudar sesión al iniciar
+Pregunta interactiva al reiniciar el bot: "¿Reanudar última sesión?" con botones inline y timeout.
+
+### RFC-025 — Instalación global CLI
+`npm install -g telegram-opencode`, first-run setup wizard, subcomandos `start`/`stop`/`status`/`logs`/`doctor`.
+
+### RFC-026 — Feedback visual de acciones
+Indicador de "cargando..." o animación después de cada acción mientras se espera respuesta de OpenCode.
+
+---
 
 ## Resumen
 

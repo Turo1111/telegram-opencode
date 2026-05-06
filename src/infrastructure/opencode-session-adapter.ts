@@ -626,7 +626,7 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       mapAdapterResultError(
         unsupportedError(
           "createSession",
-          "En modo CLI no se pueden crear sesiones desde Telegram. Creá/continuá una sesión desde OpenCode en tu PC/WSL y luego vinculala con /session <id>."
+          "En modo CLI no se pueden crear sesiones desde Telegram. Creá/continuá una sesión desde OpenCode en tu terminal local y luego vinculala con /session <id>."
         )
       )
     );
@@ -842,7 +842,7 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       mapAdapterResultError(
         unsupportedError(
           "cancelOrInterrupt",
-          "En modo CLI no está disponible /cancel. Gestioná la interrupción desde tu terminal OpenCode en PC/WSL."
+          "En modo CLI no está disponible /cancel. Gestioná la interrupción desde tu terminal OpenCode en tu terminal local."
         )
       )
     );
@@ -863,7 +863,7 @@ export class CliOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       mapAdapterResultError(
         unsupportedError(
           "submitPromptInput",
-          "En modo CLI la continuación de prompts interactivos se hace desde OpenCode en PC/WSL."
+          "En modo CLI la continuación de prompts interactivos se hace desde OpenCode en tu terminal local."
         )
       )
     );
@@ -965,7 +965,7 @@ export class PtyOpenCodeSessionAdapter implements OpenCodeSessionAdapter {
       mapAdapterResultError(
         unsupportedError(
           "createSession",
-          "En modo PTY no se pueden crear sesiones desde Telegram. Creá/continuá una sesión desde OpenCode en tu PC/WSL y luego vinculala con /session <id>."
+          "En modo PTY no se pueden crear sesiones desde Telegram. Creá/continuá una sesión desde OpenCode en tu terminal local y luego vinculala con /session <id>."
         )
       )
     );

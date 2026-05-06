@@ -65,7 +65,7 @@ export async function bootstrapApplication(deps: StartupDependencies = DEFAULT_S
   const adapterMode = config.openCodeAdapter ?? OPEN_CODE_ADAPTER_MODE.HTTP;
   const isLocalCliLikeMode =
     adapterMode === OPEN_CODE_ADAPTER_MODE.CLI || adapterMode === OPEN_CODE_ADAPTER_MODE.PTY;
-  const localTerminalLauncher = createLocalTerminalLauncher({
+  const localTerminalLauncher = await createLocalTerminalLauncher({
     timeoutMs: config.localTerminalLaunchTimeoutMs ?? 4000,
   });
 

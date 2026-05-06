@@ -774,11 +774,11 @@ async function verifyCliProjectGuidanceAndUnsupportedCommands(): Promise<void> {
   await router.handleMessage(createTelegramMessage("hola-cli"));
   assert.match(sentMessages[3] ?? "", /mirror|Te respondo por acá/i);
   await router.handleMessage(createTelegramMessage("/new"));
-  assert.match(sentMessages[4] ?? "", /PC\/WSL/i);
+  assert.match(sentMessages[4] ?? "", /Usá.*new/i);
 
   await router.handleMessage(createTelegramMessage("/cancel"));
   assert.match(sentMessages[5] ?? "", /no está disponible \/cancel/i);
-  assert.match(sentMessages[5] ?? "", /PC\/WSL/i);
+  assert.match(sentMessages[5] ?? "", /tu terminal/i);
 }
 
 async function verifyCliSessionSwitchContinuity(): Promise<void> {

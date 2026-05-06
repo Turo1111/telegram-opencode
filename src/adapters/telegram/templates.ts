@@ -185,7 +185,7 @@ export function formatSessionCreated(sessionId: string, projectId: string): stri
       session: sessionId,
       state: "session-linked",
     },
-    lines: ["La sesión quedó lista para operar. Si usás backend CLI, la creación se hace primero desde PC/WSL."],
+    lines: ["La sesión quedó lista para operar. Si usás backend CLI, la creación se hace primero desde tu terminal."],
   });
 }
 
