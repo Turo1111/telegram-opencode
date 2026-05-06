@@ -51,13 +51,19 @@ No hay magia: hay un adaptador de entrada (Telegram), una capa de aplicación, p
 - Un **bot de Telegram** propio
 - Tu **Telegram `from.id`**
 - `opencode` disponible en `PATH`
-- `tmux` disponible en `PATH`
+### Instalación de tmux (obligatorio)
 
-  **Windows:** via WSL (Ubuntu), Git Bash, MSYS2 o Cygwin.
-  **Linux:** `apt install tmux` / `pacman -S tmux` / `dnf install tmux`.
-  **macOS:** `brew install tmux`.
+tmux es OBLIGATORIO. No hay soporte de sesiones PTY sin tmux.
 
-  tmux es OBLIGATORIO. No hay soporte de sesiones PTY sin tmux.
+| Plataforma | Comando |
+|------------|---------|
+| Ubuntu/Debian | `sudo apt install tmux` |
+| Arch/Manjaro | `sudo pacman -S tmux` |
+| Fedora/RHEL | `sudo dnf install tmux` |
+| macOS | `brew install tmux` |
+| Windows | Via WSL, Git Bash, MSYS2 o Cygwin |
+
+Verificá con `tmux -V`.
 
 ### Requisito importante de paths
 
@@ -193,24 +199,27 @@ Si ya conocés el `sessionId`, podés vincularlo manualmente con:
 🟢 Sesión vinculada
 ```
 
-## Adjuntarte desde tu terminal local a la misma sesión
+## Adjuntarte a la sesión local
 
-El nombre de la sesión `tmux` sigue el formato:
+Usá `/attach-local` desde Telegram para que el bot **abra automáticamente** la terminal con la sesión tmux correspondiente. Funciona en todas las plataformas soportadas:
 
-```bash
-tmux attach -t tgoc_<session_id_sanitized>
-```
+| Plataforma | Terminal que abre automáticamente |
+|------------|-----------------------------------|
+| Windows + WSL | Windows Terminal → PowerShell → WSL |
+| Windows + Git Bash | Windows Terminal → PowerShell → Git Bash |
+| Linux | gnome-terminal, konsole, x-terminal-emulator o `$TERMINAL` |
+| macOS | Terminal.app o iTerm |
 
-El comando exacto depende de tu plataforma:
+Si la terminal no se abre automáticamente (ej: servidor headless sin GUI), usá el comando manual:
 
-| Plataforma | Comando |
-|------------|---------|
+| Plataforma | Comando manual |
+|------------|----------------|
 | **Windows + WSL** | `wsl.exe bash -lc 'tmux attach -t tgoc_<id>'` |
 | **Windows + Git Bash/MSYS2** | `bash.exe -lc 'tmux attach -t tgoc_<id>'` |
 | **Linux nativo** | `tmux attach -t tgoc_<id>` |
 | **macOS** | `tmux attach -t tgoc_<id>` |
 
-También podés usar `/attach-local` desde Telegram (si está habilitado) para que el bot abra la terminal automáticamente.
+El nombre de la sesión sigue el formato `tgoc_<session_id_sanitized>`.
 
 ## Scripts útiles
 

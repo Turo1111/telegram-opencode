@@ -231,7 +231,7 @@ bash.exe -lc 'tmux attach -t <session>'
 
 ## 7. README y Quick Start
 
-### 7.1 Sección Requisitos (README)
+### 7.1 Sección Requisitos — Instalación de tmux (README)
 
 Actual:
 
@@ -239,60 +239,59 @@ Actual:
 - `tmux` disponible en `PATH`
 ```
 
-Propuesto (expandir con contexto multiplataforma):
+Propuesto (sub-sección dedicada con tabla por plataforma):
 
 ```markdown
-- `tmux` disponible en `PATH`
+### Instalación de tmux (obligatorio)
 
-  **Windows:** via WSL (Ubuntu), Git Bash, MSYS2 o Cygwin.
-  **Linux:** `apt install tmux` / `pacman -S tmux` / `dnf install tmux`.
-  **macOS:** `brew install tmux`.
-
-  tmux es OBLIGATORIO. No hay soporte de sesiones PTY sin tmux.
-```
-
-### 7.2 Sección Adjuntarte desde PC (README)
-
-Actual:
-
-```markdown
-## Adjuntarte desde PC a la misma sesión
-
-El nombre de la sesión `tmux` queda así:
-
-```bash
-tmux attach -t tgoc_<session_id_sanitized>
-```
-
-Ejemplo:
-
-```bash
-tmux attach -t tgoc_mi-session-123
-```
-```
-
-Propuesto (platform-aware):
-
-```markdown
-## Adjuntarte desde tu terminal local a la misma sesión
-
-El nombre de la sesión `tmux` sigue el formato:
-
-```bash
-tmux attach -t tgoc_<session_id_sanitized>
-```
-
-El comando exacto depende de tu plataforma:
+tmux es OBLIGATORIO. No hay soporte de sesiones PTY sin tmux.
 
 | Plataforma | Comando |
 |------------|---------|
+| Ubuntu/Debian | `sudo apt install tmux` |
+| Arch/Manjaro | `sudo pacman -S tmux` |
+| Fedora/RHEL | `sudo dnf install tmux` |
+| macOS | `brew install tmux` |
+| Windows | Via WSL, Git Bash, MSYS2 o Cygwin |
+
+Verificá con `tmux -V`.
+```
+
+Deja de ser un sub-item dentro de un bullet y pasa a ser una sub-sección dedicada. Es más escaneable y directo.
+
+### 7.2 Sección Adjuntarte a la sesión local (README)
+
+Actual (prioriza comando manual):
+
+> Muestra primero el comando `tmux attach` y luego menciona `/attach-local` como nota al pie.
+
+Propuesto (prioriza apertura automática, comando manual como fallback):
+
+```markdown
+## Adjuntarte a la sesión local
+
+Usá `/attach-local` desde Telegram para que el bot **abra automáticamente** la terminal con la sesión tmux correspondiente. Funciona en todas las plataformas soportadas:
+
+| Plataforma | Terminal que abre automáticamente |
+|------------|-----------------------------------|
+| Windows + WSL | Windows Terminal → PowerShell → WSL |
+| Windows + Git Bash | Windows Terminal → PowerShell → Git Bash |
+| Linux | gnome-terminal, konsole, x-terminal-emulator o `$TERMINAL` |
+| macOS | Terminal.app o iTerm |
+
+Si la terminal no se abre automáticamente (ej: servidor headless sin GUI), usá el comando manual:
+
+| Plataforma | Comando manual |
+|------------|----------------|
 | **Windows + WSL** | `wsl.exe bash -lc 'tmux attach -t tgoc_<id>'` |
 | **Windows + Git Bash/MSYS2** | `bash.exe -lc 'tmux attach -t tgoc_<id>'` |
 | **Linux nativo** | `tmux attach -t tgoc_<id>` |
 | **macOS** | `tmux attach -t tgoc_<id>` |
 
-También podés usar `/attach-local` desde Telegram (si está habilitado) para que el bot abra la terminal automáticamente.
+El nombre de la sesión sigue el formato `tgoc_<session_id_sanitized>`.
 ```
+
+Justificación: `/attach-local` es la feature principal (RFC-014). El comando manual es fallback. Mostrar el automático primero y el manual después refleja la realidad del código.
 
 ### 7.3 Quick Start — paso 5
 
